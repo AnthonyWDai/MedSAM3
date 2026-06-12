@@ -61,7 +61,7 @@ Follow these steps to run inference on your medical images.
 ### 1. Setup
 ```python
 # Clone repository
-git clone https://github.com/Joey-S-Liu/MedSAM3.git
+git clone https://github.com/AnthonyWDai/MedSAM3.git
 cd MedSAM3
 
 # Install dependencies

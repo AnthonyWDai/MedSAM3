@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 SAM3 LoRA Training with PROPER Category Support
 

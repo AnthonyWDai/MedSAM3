@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Main training script for SAM3 LoRA fine-tuning.
 
