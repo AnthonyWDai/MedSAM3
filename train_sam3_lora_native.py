@@ -1189,6 +1189,7 @@ class SAM3TrainerNative:
         if self.multi_gpu:
             cleanup_distributed()
 
+
 def launch_distributed_training(args):
     """Launch training with multiple GPUs using torchrun subprocess."""
     import subprocess
