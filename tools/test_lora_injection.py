@@ -7,7 +7,7 @@ This creates a simple transformer model and injects LoRA to verify functionality
 
 import torch
 import torch.nn as nn
-from src.lora.lora_utils import LoRAConfig, inject_lora_into_model, print_trainable_parameters
+from tools.src.lora.lora_utils import LoRAConfig, inject_lora_into_model, print_trainable_parameters
 
 
 class SimpleTransformer(nn.Module):

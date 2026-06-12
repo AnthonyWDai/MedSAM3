@@ -9,8 +9,8 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from src.lora.lora_utils import LoRAConfig, inject_lora_into_model, print_trainable_parameters
-from src.data.dataset import LoRASAM3Dataset
+from tools.src.lora.lora_utils import LoRAConfig, inject_lora_into_model, print_trainable_parameters
+from tools.src.data.dataset import LoRASAM3Dataset
 
 
 def simple_collate(batch):
@@ -150,7 +150,7 @@ def main():
     
     # 6. Save LoRA weights
     print("\n6. Saving LoRA weights...")
-    from src.lora.lora_utils import get_lora_state_dict
+    from tools.src.lora.lora_utils import get_lora_state_dict
     
     lora_weights = get_lora_state_dict(model)
     output_path = "/workspace/sam3_lora/demo_lora.pt"

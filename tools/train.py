@@ -22,9 +22,9 @@ import yaml
 
 from sam3.model_builder import build_sam3_image_model
 
-from src.lora.lora_utils import LoRAConfig
-from src.data.dataset import create_dataloaders
-from src.train.train_lora import LoRATrainer
+from tools.src.lora.lora_utils import LoRAConfig
+from tools.src.data.dataset import create_dataloaders
+from tools.src.train.train_lora import LoRATrainer
 
 
 def load_config(config_path: str) -> dict:

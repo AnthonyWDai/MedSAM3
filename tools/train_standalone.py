@@ -10,10 +10,10 @@ import yaml
 import torch
 from torch.utils.data import DataLoader
 
-from sam3_lora import LoRAConfig, inject_lora_into_model
-from sam3_lora.model import SimpleSegmentationModel
-from sam3_lora.data import LoRASAM3Dataset
-from sam3_lora.train import SimpleLoRATrainer
+from tools.sam3_lora import LoRAConfig, inject_lora_into_model
+from tools.sam3_lora.model import SimpleSegmentationModel
+from tools.sam3_lora.data import LoRASAM3Dataset
+from tools.sam3_lora.train import SimpleLoRATrainer
 
 
 def simple_collate(batch):
