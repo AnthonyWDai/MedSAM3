@@ -20,6 +20,7 @@ Examples:
 """
 
 import os
+import csv
 import sys
 import json
 import argparse
@@ -116,40 +117,33 @@ def set_seed(seed: int):
 # Dataset
 # ============================================================================
 
-class COCOSegmentDataset(Dataset):
-    """Dataset class for COCO format segmentation data"""
-    def __init__(self, data_dir, split="train"):
-        """
-        Args:
-            data_dir: Root directory containing train/valid/test folders
-            split: One of 'train', 'valid', 'test'
-        """
+class FolderSegmentDataset(Dataset):
+    """
+    Dataset for segmentation data with text prompts read from CSV.
+
+    Expected CSV columns:
+        split,label,case_id,channel_0000,channel_0001,response
+
+    Notes:
+    - response is used as query_text
+    - channel_0000 and channel_0001 are ignored for text prompt construction
+    """
+
+    def __init__(self, data_dir, csv_path, split="train"):
         self.data_dir = Path(data_dir)
+        self.csv_path = Path(csv_path)
         self.split = split
+
         self.split_dir = self.data_dir / split
+        self.images_dir = self.split_dir / "images"
+        self.masks_dir = self.split_dir / "masks"
 
-        ann_file = self.split_dir / "_annotations.coco.json"
-        if not ann_file.exists():
-            raise FileNotFoundError(f"COCO annotation file not found: {ann_file}")
-
-        with open(ann_file, "r") as f:
-            self.coco_data = json.load(f)
-
-        self.images = {img["id"]: img for img in self.coco_data["images"]}
-        self.image_ids = sorted(list(self.images.keys()))
-
-        self.img_to_anns = {}
-        for ann in self.coco_data["annotations"]:
-            img_id = ann["image_id"]
-            if img_id not in self.img_to_anns:
-                self.img_to_anns[img_id] = []
-            self.img_to_anns[img_id].append(ann)
-
-        self.categories = {cat["id"]: cat["name"] for cat in self.coco_data["categories"]}
-        print(f"Loaded COCO dataset: {split} split")
-        print(f"  Images: {len(self.image_ids)}")
-        print(f"  Annotations: {len(self.coco_data['annotations'])}")
-        print(f"  Categories: {self.categories}")
+        if not self.images_dir.exists():
+            raise FileNotFoundError(f"Images directory not found: {self.images_dir}")
+        if not self.masks_dir.exists():
+            raise FileNotFoundError(f"Masks directory not found: {self.masks_dir}")
+        if not self.csv_path.exists():
+            raise FileNotFoundError(f"CSV file not found: {self.csv_path}")
 
         self.resolution = 1008
         self.transform = v2.Compose([
@@ -158,96 +152,203 @@ class COCOSegmentDataset(Dataset):
             v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
         ])
 
+        self.samples = []
+
+        valid_img_exts = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+
+        with open(self.csv_path, "r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            sample_id = 0
+
+            for row in reader:
+                if row["split"] != split:
+                    continue
+
+                label = row["label"]
+                case_id = row["case_id"]
+                response = row["response"].strip() if row["response"] is not None else ""
+
+                class_img_dir = self.images_dir / label
+                class_mask_dir = self.masks_dir / label
+
+                if not class_img_dir.exists():
+                    print(f"Warning: image directory missing for label '{label}': {class_img_dir}")
+                    continue
+                if not class_mask_dir.exists():
+                    print(f"Warning: mask directory missing for label '{label}': {class_mask_dir}")
+                    continue
+
+                # Find image by case_id stem, ignoring channel columns
+                candidate_images = [
+                    class_img_dir / f"{case_id}.png",
+                    class_img_dir / f"{case_id}.jpg",
+                    class_img_dir / f"{case_id}.jpeg",
+                    class_img_dir / f"{case_id}.bmp",
+                    class_img_dir / f"{case_id}.tif",
+                    class_img_dir / f"{case_id}.tiff",
+                ]
+                img_path = next((p for p in candidate_images if p.exists()), None)
+
+                candidate_masks = [
+                    class_mask_dir / f"{case_id}.png",
+                    class_mask_dir / f"{case_id}.jpg",
+                    class_mask_dir / f"{case_id}.jpeg",
+                    class_mask_dir / f"{case_id}.bmp",
+                    class_mask_dir / f"{case_id}.tif",
+                    class_mask_dir / f"{case_id}.tiff",
+                ]
+                mask_path = next((p for p in candidate_masks if p.exists()), None)
+
+                if img_path is None:
+                    print(f"Warning: no image found for case_id={case_id}, label={label}")
+                    continue
+
+                if mask_path is None:
+                    print(f"Warning: no mask found for case_id={case_id}, label={label}")
+                    continue
+
+                self.samples.append({
+                    "id": sample_id,
+                    "image_path": img_path,
+                    "mask_path": mask_path,
+                    "label": label,
+                    "case_id": case_id,
+                    "response": response,
+                })
+                sample_id += 1
+
+        print(f"Loaded CSV-driven dataset: {split} split")
+        print(f"  Samples: {len(self.samples)}")
+
     def __len__(self):
-        return len(self.image_ids)
+        return len(self.samples)
 
     def __getitem__(self, idx):
-        img_id = self.image_ids[idx]
-        img_info = self.images[img_id]
+        sample = self.samples[idx]
+        img_id = sample["id"]
+        img_path = sample["image_path"]
+        mask_path = sample["mask_path"]
+        response = sample["response"]
 
-        img_path = self.split_dir / img_info["file_name"]
         pil_image = PILImage.open(img_path).convert("RGB")
         orig_w, orig_h = pil_image.size
 
-        pil_image = pil_image.resize((self.resolution, self.resolution), PILImage.BILINEAR)
-        image_tensor = self.transform(pil_image)
+        resized_image = pil_image.resize((self.resolution, self.resolution), PILImage.BILINEAR)
+        image_tensor = self.transform(resized_image)
 
-        annotations = self.img_to_anns.get(img_id, [])
-        objects = []
-        object_class_names = []
+        try:
+            mask_image = PILImage.open(mask_path).convert("L")
+            mask_np = np.array(mask_image)
+            mask_bin = (mask_np > 0).astype(np.uint8)
 
-        scale_w = self.resolution / orig_w
-        scale_h = self.resolution / orig_h
-
-        for ann in annotations:
-            bbox_coco = ann.get("bbox", None)
-            if bbox_coco is None:
-                continue
-
-            category_id = ann.get("category_id", 0)
-            class_name = self.categories.get(category_id, "object")
-            object_class_names.append(class_name)
-
-            x, y, w, h = bbox_coco
-            cx = x + w / 2.0
-            cy = y + h / 2.0
-
-            box_tensor = torch.tensor([
-                cx * scale_w / self.resolution,
-                cy * scale_h / self.resolution,
-                w * scale_w / self.resolution,
-                h * scale_h / self.resolution,
-            ], dtype=torch.float32)
-
-            segment = None
-            segmentation = ann.get("segmentation", None)
-
-            if segmentation:
-                try:
-                    if isinstance(segmentation, dict):
-                        mask_np = mask_utils.decode(segmentation)
-                    elif isinstance(segmentation, list):
-                        rles = mask_utils.frPyObjects(segmentation, orig_h, orig_w)
-                        rle = mask_utils.merge(rles)
-                        mask_np = mask_utils.decode(rle)
-                    else:
-                        print(f"Warning: Unknown segmentation format: {type(segmentation)}")
-                        continue
-
-                    mask_t = torch.from_numpy(mask_np).float().unsqueeze(0).unsqueeze(0)
-                    mask_t = torch.nn.functional.interpolate(
-                        mask_t,
-                        size=(self.resolution, self.resolution),
-                        mode="nearest"
+            if mask_bin.sum() == 0:
+                objects = []
+                queries = [
+                    FindQueryLoaded(
+                        query_text=response,
+                        image_id=0,
+                        object_ids_output=[],
+                        is_exhaustive=True,
+                        query_processing_order=0,
+                        inference_metadata=InferenceMetadata(
+                            coco_image_id=img_id,
+                            original_image_id=img_id,
+                            original_category_id=0,
+                            original_size=(orig_h, orig_w),
+                            object_id=-1,
+                            frame_index=-1
+                        )
                     )
-                    segment = mask_t.squeeze(0).squeeze(0) > 0.5
-                except Exception as e:
-                    print(f"Warning: Failed to process segmentation for image {img_id}: {e}")
-                    segment = None
+                ]
+            else:
+                ys, xs = np.where(mask_bin > 0)
+                x_min, x_max = xs.min(), xs.max()
+                y_min, y_max = ys.min(), ys.max()
 
-            obj = Object(
-                bbox=box_tensor,
-                category_id=category_id,
-                category_name=class_name,
-                segment=segment,
-            )
-            objects.append(obj)
+                x = float(x_min)
+                y = float(y_min)
+                w = float(x_max - x_min + 1)
+                h = float(y_max - y_min + 1)
 
-        image = Image(
-            image=image_tensor,
+                cx = x + w / 2.0
+                cy = y + h / 2.0
+
+                scale_w = self.resolution / orig_w
+                scale_h = self.resolution / orig_h
+
+                box_tensor = torch.tensor([
+                    cx * scale_w / self.resolution,
+                    cy * scale_h / self.resolution,
+                    w * scale_w / self.resolution,
+                    h * scale_h / self.resolution,
+                ], dtype=torch.float32)
+
+                mask_t = torch.from_numpy(mask_bin).float().unsqueeze(0).unsqueeze(0)
+                mask_t = torch.nn.functional.interpolate(
+                    mask_t,
+                    size=(self.resolution, self.resolution),
+                    mode="nearest"
+                )
+                segment = mask_t.squeeze() > 0.5
+
+                obj = Object(
+                    bbox=box_tensor,
+                    area=(box_tensor[2] * box_tensor[3]).item(),
+                    object_id=0,
+                    segment=segment
+                )
+                objects = [obj]
+
+                queries = [
+                    FindQueryLoaded(
+                        query_text=response,
+                        image_id=0,
+                        object_ids_output=[0],
+                        is_exhaustive=True,
+                        query_processing_order=0,
+                        inference_metadata=InferenceMetadata(
+                            coco_image_id=img_id,
+                            original_image_id=img_id,
+                            original_category_id=0,
+                            original_size=(orig_h, orig_w),
+                            object_id=-1,
+                            frame_index=-1
+                        )
+                    )
+                ]
+
+        except Exception as e:
+            print(f"Warning: Error processing sample {img_path}: {e}")
+            objects = []
+            queries = [
+                FindQueryLoaded(
+                    query_text=response,
+                    image_id=0,
+                    object_ids_output=[],
+                    is_exhaustive=True,
+                    query_processing_order=0,
+                    inference_metadata=InferenceMetadata(
+                        coco_image_id=img_id,
+                        original_image_id=img_id,
+                        original_category_id=0,
+                        original_size=(orig_h, orig_w),
+                        object_id=-1,
+                        frame_index=-1
+                    )
+                )
+            ]
+
+        image_obj = Image(
+            data=image_tensor,
             objects=objects,
-            object_class_names=object_class_names,
+            size=(self.resolution, self.resolution)
         )
 
-        datapoint = Datapoint(
-            images=[image],
-            find_queries=[FindQueryLoaded(query_text="Find all objects")],
-            inference_metadata=InferenceMetadata(image_id=img_id),
+        return Datapoint(
+            find_queries=queries,
+            images=[image_obj],
+            raw_images=[pil_image]
         )
-
-        return datapoint
-
-
 # ============================================================================
 # Optional Eval Helpers (kept from original file)
 # ============================================================================
@@ -493,23 +594,32 @@ class SAM3TrainerNative:
         data_dir = self.args.data_dir
 
         print_rank0(f"\nLoading training data from {data_dir}...")
-        train_ds = COCOSegmentDataset(data_dir=data_dir, split="train")
+        train_ds = FolderSegmentDataset(
+            data_dir=data_dir,
+            csv_path=self.args.train_csv_path,
+            split="train",
+        )
 
         has_validation = False
         val_ds = None
 
-        try:
-            print_rank0(f"\nLoading validation data from {data_dir}...")
-            val_ds = COCOSegmentDataset(data_dir=data_dir, split="valid")
-            if len(val_ds) > 0:
-                has_validation = True
-                print_rank0(f"Found validation data: {len(val_ds)} images")
-            else:
-                print_rank0("Validation dataset is empty.")
+        if self.args.val_csv_path is not None:
+            try:
+                print_rank0(f"\nLoading validation data from {self.args.val_csv_path}...")
+                val_ds = FolderSegmentDataset(
+                    data_dir=data_dir,
+                    csv_path=self.args.val_csv_path,
+                    split="val",
+                )
+                if len(val_ds) > 0:
+                    has_validation = True
+                    print_rank0(f"Found validation data: {len(val_ds)} images")
+                else:
+                    print_rank0("Validation dataset is empty.")
+                    val_ds = None
+            except Exception as e:
+                print_rank0(f"Could not load validation data: {e}")
                 val_ds = None
-        except Exception as e:
-            print_rank0(f"Could not load validation data: {e}")
-            val_ds = None
 
         def collate_fn(batch):
             return collate_fn_api(batch, dict_key="input", with_seg_masks=True)
@@ -838,7 +948,7 @@ Examples:
     # Training
     parser.add_argument("--data_dir", type=str, default="/workspace/data")
     parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--learning_rate", type=float, default=5e-5)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--adam_beta1", type=float, default=0.9)
@@ -853,9 +963,12 @@ Examples:
     parser.add_argument("--save_steps", type=int, default=100)
     parser.add_argument("--save_total_limit", type=int, default=5)
     parser.add_argument("--mixed_precision", type=str, default="bf16")
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=999)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=8)
-
+    parser.add_argument("--train_csv_path", type=str, required=True,
+                    help="Path to training CSV file")
+    parser.add_argument("--val_csv_path", type=str, default=None,
+                        help="Path to validation CSV file")
     # Output
     parser.add_argument("--output_dir", type=str, default="outputs/sam3_lora_full")
     parser.add_argument("--logging_dir", type=str, default="logs")
