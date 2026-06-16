@@ -113,6 +113,20 @@ def set_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
 
 
+def recommended_num_workers(reserve=1, train=True):
+    if hasattr(os, "sched_getaffinity"):
+        n_cpu = len(os.sched_getaffinity(0))
+    else:
+        n_cpu = os.cpu_count() or 1
+
+    usable = max(1, n_cpu - reserve)
+
+    if train:
+        return max(1, min(usable, 4))
+    else:
+        return max(1, min(usable // 2, 2))
+
+
 # ============================================================================
 # Dataset
 # ============================================================================
@@ -642,24 +656,30 @@ class SAM3TrainerNative:
                     shuffle=False
                 )
 
+        if not self.args.num_workers:
+            train_num_workers = recommended_num_workers(train=True)
+
         train_loader = DataLoader(
             train_ds,
             batch_size=self.args.batch_size,
             shuffle=(train_sampler is None),
             sampler=train_sampler,
             collate_fn=collate_fn,
-            num_workers=self.args.num_workers,
+            num_workers=train_num_workers,
             pin_memory=self.args.dataloader_pin_memory,
         )
 
         if has_validation:
+            if not self.args.num_workers:
+                val_num_workers = recommended_num_workers(train=False)
+
             val_loader = DataLoader(
                 val_ds,
                 batch_size=self.args.batch_size,
                 shuffle=False,
                 sampler=val_sampler,
                 collate_fn=collate_fn,
-                num_workers=self.args.num_workers,
+                num_workers=val_num_workers,
                 pin_memory=self.args.dataloader_pin_memory,
             )
         else:
@@ -948,7 +968,7 @@ Examples:
     # Training
     parser.add_argument("--data_dir", type=str, default="/workspace/data")
     parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--num_workers", type=int, default=None)
     parser.add_argument("--learning_rate", type=float, default=5e-5)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--adam_beta1", type=float, default=0.9)
