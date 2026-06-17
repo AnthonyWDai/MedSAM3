@@ -543,6 +543,10 @@ def _load_checkpoint(model, checkpoint_path):
             f"loaded {checkpoint_path} and found "
             f"missing and/or unexpected keys:\n{missing_keys=}"
         )
+    else:
+        print(
+            f"loaded {checkpoint_path} and does not found missing key"
+        )
 
 
 def _setup_device_and_mode(model, device, eval_mode):

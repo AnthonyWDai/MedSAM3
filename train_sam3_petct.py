@@ -1,22 +1,30 @@
 """
 SAM3 LoRA Training Script (CLI-only config)
 
-Validation Strategy (Following SAM3):
-  - During training: Only compute validation LOSS (fast, no metrics)
-  - After training: Run validate_sam3_lora.py for full metrics (mAP, cgF1) with NMS
+Validation Strategy:
+  - During training:
+      * Compute validation loss
+      * Compute validation segmentation Dice
+      * Run validation every 10% of total epochs
+  - After training:
+      * Optionally run validate_sam3_lora.py for full metrics (mAP, cgF1) with NMS
 
 Examples:
   Single GPU:
-    python train_sam3_petct.py \
+    python3 train_sam3_petct.py \
       --data_dir /workspace/data \
       --output_dir outputs/sam3_lora_full \
-      --device 0
+      --device 0 \
+      --train_csv_path /workspace/data/train.csv \
+      --val_csv_path /workspace/data/val.csv
 
   Multi-GPU:
-    python train_sam3_petct.py \
+    python3 train_sam3_petct.py \
       --data_dir /workspace/data \
       --output_dir outputs/sam3_lora_full \
-      --device 0 1
+      --device 0 1 \
+      --train_csv_path /workspace/data/train.csv \
+      --val_csv_path /workspace/data/val.csv
 """
 
 import os
@@ -26,7 +34,6 @@ import json
 import argparse
 import random
 import shutil
-import contextlib
 from pathlib import Path
 
 import numpy as np
@@ -34,7 +41,6 @@ from PIL import Image as PILImage
 from tqdm import tqdm
 
 import torch
-import torch.nn as nn
 import torch.distributed as dist
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
@@ -42,7 +48,6 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from torchvision.transforms import v2
-import pycocotools.mask as mask_utils
 
 # SAM3 Imports
 from sam3.model_builder import build_sam3_image_model
@@ -51,8 +56,13 @@ from sam3.train.loss.loss_fns import IABCEMdetr, Boxes, Masks, CORE_LOSS_KEY
 from sam3.train.loss.sam3_loss import Sam3LossWrapper
 from sam3.train.matcher import BinaryHungarianMatcherV2, BinaryOneToManyMatcher
 from sam3.train.data.collator import collate_fn_api
-from sam3.train.data.sam3_image_dataset import Datapoint, Image, Object, FindQueryLoaded, InferenceMetadata
-from sam3.model.box_ops import box_xywh_to_xyxy
+from sam3.train.data.sam3_image_dataset import (
+    Datapoint,
+    Image,
+    Object,
+    FindQueryLoaded,
+    InferenceMetadata,
+)
 from sam3.train.masks_ops import rle_encode
 
 from lora_layers import LoRAConfig, apply_lora_to_model, save_lora_weights, count_parameters
@@ -167,9 +177,6 @@ class FolderSegmentDataset(Dataset):
         ])
 
         self.samples = []
-
-        valid_img_exts = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
-
         with open(self.csv_path, "r", newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             sample_id = 0
@@ -192,7 +199,6 @@ class FolderSegmentDataset(Dataset):
                     print(f"Warning: mask directory missing for label '{label}': {class_mask_dir}")
                     continue
 
-                # Find image by case_id stem, ignoring channel columns
                 candidate_images = [
                     class_img_dir / f"{case_id}.png",
                     class_img_dir / f"{case_id}.jpg",
@@ -363,8 +369,10 @@ class FolderSegmentDataset(Dataset):
             images=[image_obj],
             raw_images=[pil_image]
         )
+
+
 # ============================================================================
-# Optional Eval Helpers (kept from original file)
+# Optional Eval Helpers
 # ============================================================================
 
 def merge_overlapping_masks(binary_masks, scores, boxes, iou_threshold=0.3):
@@ -412,74 +420,39 @@ def merge_overlapping_masks(binary_masks, scores, boxes, iou_threshold=0.3):
     return merged_masks, merged_scores, merged_boxes
 
 
-def convert_predictions_to_coco_format(
-    predictions_list,
-    image_ids,
-    resolution=288,
-    score_threshold=0.0,
-    merge_overlaps=True,
-    iou_threshold=0.3,
-    debug=False,
-):
-    coco_predictions = []
-    pred_id = 0
+def compute_seg_dice_stats(pred, target, num_classes, eps=1e-5):
+    """
+    pred:   [B, H, W] predicted class ids
+    target: [B, H, W] ground truth class ids
 
-    for img_id, preds in zip(image_ids, predictions_list):
-        if preds is None or len(preds.get("pred_logits", [])) == 0:
-            continue
+    Returns:
+        dice_sum: sum of Dice scores over valid (sample, class) pairs
+        valid_count: number of valid (sample, class) pairs
 
-        logits = preds["pred_logits"]
-        boxes = preds["pred_boxes"]
-        masks = preds["pred_masks"]
+    Valid means the class is present in pred or target.
+    Absent-in-both cases are excluded from aggregation.
+    """
+    assert pred.shape == target.shape, "pred and target must have the same shape"
+    reduce_dims = tuple(range(1, pred.ndim))
+    dice_sum = 0.0
+    valid_count = 0
 
-        scores = torch.sigmoid(logits).squeeze(-1)
+    for cls in range(1, num_classes + 1):
+        pred_c = (pred == cls).float()
+        target_c = (target == cls).float()
 
-        valid_mask = scores > score_threshold
-        num_before = len(scores)
-        scores = scores[valid_mask]
-        boxes = boxes[valid_mask]
-        masks = masks[valid_mask]
+        intersect = (pred_c * target_c).sum(dim=reduce_dims)
+        pred_sum = pred_c.sum(dim=reduce_dims)
+        target_sum = target_c.sum(dim=reduce_dims)
+        denom = pred_sum + target_sum
+        valid = denom > 0
 
-        if debug and img_id == image_ids[0]:
-            print(f"  Image {img_id}: {num_before} queries -> {len(scores)} after filtering (threshold={score_threshold})")
+        if valid.any():
+            dice = (2.0 * intersect[valid] + eps) / (denom[valid] + eps)
+            dice_sum += dice.sum().item()
+            valid_count += valid.sum().item()
 
-        binary_masks = (torch.sigmoid(masks) > 0.5).cpu()
-
-        if merge_overlaps and len(binary_masks) > 0:
-            num_before_merge = len(binary_masks)
-            binary_masks, scores, boxes = merge_overlapping_masks(
-                binary_masks, scores.cpu(), boxes.cpu(), iou_threshold=iou_threshold
-            )
-            if debug and img_id == image_ids[0]:
-                print(f"  Merged {num_before_merge} predictions -> {len(binary_masks)} (IoU threshold={iou_threshold})")
-
-        if len(binary_masks) > 0:
-            mask_areas = binary_masks.flatten(1).sum(1)
-
-            if debug and img_id == image_ids[0]:
-                print(f"  Mask shape: {binary_masks.shape}")
-                print(f"  Mask areas: min={mask_areas.min():.0f}, max={mask_areas.max():.0f}, mean={mask_areas.float().mean():.0f}")
-
-            rles = rle_encode(binary_masks)
-
-            for rle, score, box in zip(rles, scores.cpu().tolist(), boxes.cpu().tolist()):
-                cx, cy, w, h = box
-                x = (cx - w / 2) * resolution
-                y = (cy - h / 2) * resolution
-                w = w * resolution
-                h = h * resolution
-
-                coco_predictions.append({
-                    "image_id": int(img_id),
-                    "category_id": 1,
-                    "segmentation": rle,
-                    "bbox": [float(x), float(y), float(w), float(h)],
-                    "score": float(score),
-                    "id": pred_id,
-                })
-                pred_id += 1
-
-    return coco_predictions
+    return dice_sum, valid_count
 
 
 # ============================================================================
@@ -656,8 +629,7 @@ class SAM3TrainerNative:
                     shuffle=False
                 )
 
-        if not self.args.num_workers:
-            train_num_workers = recommended_num_workers(train=True)
+        train_num_workers = self.args.num_workers if self.args.num_workers is not None else recommended_num_workers(train=True)
 
         train_loader = DataLoader(
             train_ds,
@@ -670,8 +642,7 @@ class SAM3TrainerNative:
         )
 
         if has_validation:
-            if not self.args.num_workers:
-                val_num_workers = recommended_num_workers(train=False)
+            val_num_workers = self.args.num_workers if self.args.num_workers is not None else recommended_num_workers(train=False)
 
             val_loader = DataLoader(
                 val_ds,
@@ -689,7 +660,10 @@ class SAM3TrainerNative:
 
         epochs = self.args.num_epochs
         best_val_loss = float("inf")
+        val_interval = max(1, epochs // 10)
+
         print_rank0(f"Starting training for {epochs} epochs...")
+        print_rank0(f"Validation interval: every {val_interval} epoch(s) (~10% of total epochs)")
 
         if has_validation:
             print_rank0(f"Training samples: {len(train_ds)}, Validation samples: {len(val_ds)}")
@@ -771,9 +745,15 @@ class SAM3TrainerNative:
 
             avg_train_loss = sum(train_losses) / len(train_losses) if train_losses else 0.0
 
-            if has_validation and val_loader is not None:
+            should_validate = has_validation and val_loader is not None and (
+                ((epoch + 1) % val_interval == 0) or ((epoch + 1) == epochs)
+            )
+
+            if should_validate:
                 self.model.eval()
                 val_losses = []
+                val_dice_sum = 0.0
+                val_dice_count = 0
 
                 with torch.no_grad():
                     val_pbar = tqdm(val_loader, desc="Validation", disable=not is_main_process())
@@ -806,17 +786,97 @@ class SAM3TrainerNative:
                         total_loss = loss_dict[CORE_LOSS_KEY]
 
                         val_losses.append(total_loss.item())
-                        val_pbar.set_postfix({"val_loss": total_loss.item()})
+
+                        try:
+                            final_outputs = outputs_list[-1] if isinstance(outputs_list, (list, tuple)) else outputs_list
+                            if isinstance(final_outputs, list):
+                                final_outputs = final_outputs[-1]
+
+                            pred_masks = final_outputs.get("pred_masks", None)
+                            pred_logits = final_outputs.get("pred_logits", None)
+
+                            if pred_masks is not None and pred_logits is not None and pred_masks.ndim == 4:
+                                pred_scores = torch.sigmoid(pred_logits.squeeze(-1))
+                                best_q = pred_scores.argmax(dim=1)
+
+                                batch_pred = []
+                                batch_target = []
+
+                                for b_idx, targets in enumerate(find_targets):
+                                    pred_mask_b = pred_masks[b_idx, best_q[b_idx]]
+                                    pred_bin = (torch.sigmoid(pred_mask_b) > 0.5).long()
+
+                                    gt_mask = None
+
+                                    if "masks" in targets and targets["masks"] is not None and len(targets["masks"]) > 0:
+                                        gt_mask = targets["masks"][0]
+                                        if gt_mask.ndim == 3:
+                                            gt_mask = gt_mask[0]
+                                        gt_mask = (gt_mask > 0.5).long()
+                                    elif "segment" in targets and targets["segment"] is not None:
+                                        gt_mask = targets["segment"]
+                                        if gt_mask.ndim == 3:
+                                            gt_mask = gt_mask[0]
+                                        gt_mask = (gt_mask > 0.5).long()
+                                    else:
+                                        gt_mask = torch.zeros_like(pred_bin, dtype=torch.long)
+
+                                    if gt_mask.shape != pred_bin.shape:
+                                        gt_mask = torch.nn.functional.interpolate(
+                                            gt_mask.float().unsqueeze(0).unsqueeze(0),
+                                            size=pred_bin.shape[-2:],
+                                            mode="nearest"
+                                        ).squeeze(0).squeeze(0).long()
+
+                                    batch_pred.append(pred_bin)
+                                    batch_target.append(gt_mask)
+
+                                if len(batch_pred) > 0:
+                                    batch_pred = torch.stack(batch_pred, dim=0)
+                                    batch_target = torch.stack(batch_target, dim=0)
+
+                                    dice_sum, dice_count = compute_seg_dice_stats(
+                                        batch_pred, batch_target, num_classes=1
+                                    )
+                                    val_dice_sum += dice_sum
+                                    val_dice_count += dice_count
+
+                        except Exception as e:
+                            if is_main_process():
+                                print(f"Warning: Dice computation failed on validation batch: {e}")
+
+                        val_pbar.set_postfix({
+                            "val_loss": total_loss.item(),
+                            "val_dice": (val_dice_sum / val_dice_count) if val_dice_count > 0 else 0.0
+                        })
 
                 avg_val_loss = sum(val_losses) / len(val_losses) if val_losses else 0.0
+                avg_val_dice = val_dice_sum / val_dice_count if val_dice_count > 0 else 0.0
 
                 if self.multi_gpu:
-                    val_loss_tensor = torch.tensor([avg_val_loss], device=self.device)
-                    dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.AVG)
-                    avg_val_loss = val_loss_tensor.item()
+                    val_stats_tensor = torch.tensor(
+                        [sum(val_losses), len(val_losses), val_dice_sum, val_dice_count],
+                        device=self.device,
+                        dtype=torch.float64
+                    )
+                    dist.all_reduce(val_stats_tensor, op=dist.ReduceOp.SUM)
+
+                    total_val_loss_sum = val_stats_tensor[0].item()
+                    total_val_loss_count = max(1.0, val_stats_tensor[1].item())
+                    total_val_dice_sum = val_stats_tensor[2].item()
+                    total_val_dice_count = val_stats_tensor[3].item()
+
+                    avg_val_loss = total_val_loss_sum / total_val_loss_count
+                    avg_val_dice = (
+                        total_val_dice_sum / total_val_dice_count
+                        if total_val_dice_count > 0 else 0.0
+                    )
 
                 print_rank0(
-                    f"\nEpoch {epoch+1}/{epochs} - Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}"
+                    f"\nEpoch {epoch+1}/{epochs} - "
+                    f"Train Loss: {avg_train_loss:.6f}, "
+                    f"Val Loss: {avg_val_loss:.6f}, "
+                    f"Val Dice: {avg_val_dice:.6f}"
                 )
 
                 if is_main_process():
@@ -828,17 +888,26 @@ class SAM3TrainerNative:
                         save_lora_weights(model_to_save, str(out_dir / "best_lora_weights.pt"))
                         print(f"✓ New best model saved (val_loss: {avg_val_loss:.6f})")
 
-                    with open(out_dir / "val_stats.json", "a") as f:
-                        f.write(json.dumps({
-                            "epoch": epoch + 1,
-                            "train_loss": avg_train_loss,
-                            "val_loss": avg_val_loss
-                        }) + "\n")
+                    # with open(out_dir / "val_stats.json", "a") as f:
+                    #     f.write(json.dumps({
+                    #         "epoch": epoch + 1,
+                    #         "train_loss": avg_train_loss,
+                    #         "val_loss": avg_val_loss,
+                    #         "val_dice": avg_val_dice
+                    #     }) + "\n")
 
                 torch.cuda.empty_cache()
                 self.model.train()
+
             else:
-                print_rank0(f"\nEpoch {epoch+1}/{epochs} - Train Loss: {avg_train_loss:.6f}")
+                if has_validation and val_loader is not None:
+                    print_rank0(
+                        f"\nEpoch {epoch+1}/{epochs} - Train Loss: {avg_train_loss:.6f} "
+                        f"(validation skipped; next every {val_interval} epoch[s])"
+                    )
+                else:
+                    print_rank0(f"\nEpoch {epoch+1}/{epochs} - Train Loss: {avg_train_loss:.6f}")
+
                 if is_main_process():
                     model_to_save = self.model.module if self.multi_gpu else self.model
                     save_lora_weights(model_to_save, str(out_dir / "last_lora_weights.pt"))
@@ -855,10 +924,7 @@ class SAM3TrainerNative:
                 print(f"\nModels saved to {out_dir}:")
                 print("  - best_lora_weights.pt (best validation loss)")
                 print("  - last_lora_weights.pt (last epoch)")
-                print(f"\n📊 To compute full metrics (mAP, cgF1) with NMS:")
-                print("   python validate_sam3_lora.py \\")
-                print(f"     --weights {out_dir}/best_lora_weights.pt \\")
-                print(f"     --val_data_dir {data_dir}/valid")
+                print("\nValidation stats saved to val_stats.json")
                 print(f"{'='*80}")
             else:
                 last_path = out_dir / "last_lora_weights.pt"
@@ -872,7 +938,7 @@ class SAM3TrainerNative:
                 print(f"\nModels saved to {out_dir}:")
                 print("  - best_lora_weights.pt (copy of last epoch)")
                 print("  - last_lora_weights.pt (last epoch)")
-                print("\nℹ️  No validation data - consider adding data/valid/ for better model selection")
+                print("\nℹ️  No validation data - consider adding validation data for better model selection")
                 print(f"{'='*80}")
 
         if self.multi_gpu:
@@ -920,25 +986,13 @@ def build_parser():
     parser = argparse.ArgumentParser(
         description="Train SAM3 with LoRA (CLI-only config)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  Single GPU:
-    python train_sam3_petct.py --data_dir /workspace/data --device 0
-
-  Multi-GPU:
-    python train_sam3_petct.py --data_dir /workspace/data --device 0 1
-        """
     )
 
     # Runtime / distributed
-    parser.add_argument("--device", type=int, nargs="+", default=[0],
-                        help="GPU device ID(s) to use")
-    parser.add_argument("--master_port", type=int, default=29500,
-                        help="Master port for distributed training")
-    parser.add_argument("--local_rank", type=int, default=-1,
-                        help="Local rank for distributed training")
-    parser.add_argument("--_launched_by_torchrun", action="store_true",
-                        help=argparse.SUPPRESS)
+    parser.add_argument("--device", type=int, nargs="+", default=[0], help="GPU device ID(s) to use")
+    parser.add_argument("--master_port", type=int, default=29500, help="Master port for distributed training")
+    parser.add_argument("--local_rank", type=int, default=-1, help="Local rank for distributed training")
+    parser.add_argument("--_launched_by_torchrun", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--checkpoint_path", type=str, default=None)
 
     # LoRA
@@ -985,10 +1039,9 @@ Examples:
     parser.add_argument("--mixed_precision", type=str, default="bf16")
     parser.add_argument("--seed", type=int, default=999)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=8)
-    parser.add_argument("--train_csv_path", type=str, required=True,
-                    help="Path to training CSV file")
-    parser.add_argument("--val_csv_path", type=str, default=None,
-                        help="Path to validation CSV file")
+    parser.add_argument("--train_csv_path", type=str, required=True, help="Path to training CSV file")
+    parser.add_argument("--val_csv_path", type=str, default=None, help="Path to validation CSV file")
+
     # Output
     parser.add_argument("--output_dir", type=str, default="outputs/sam3_lora_full")
     parser.add_argument("--logging_dir", type=str, default="logs")
@@ -1032,7 +1085,7 @@ def main():
 
 
 if __name__ == "__main__":
-    # python train_sam3_petct.py \
+    # python3 train_sam3_petct.py \
     # --data_dir /workspace/data \
     # --output_dir outputs/sam3_lora_full \
     # --batch_size 4 \
