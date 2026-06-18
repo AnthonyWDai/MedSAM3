@@ -35,7 +35,9 @@ import argparse
 import random
 import shutil
 from pathlib import Path
+from typing import List, Tuple
 
+import cv2
 import numpy as np
 from PIL import Image as PILImage
 from tqdm import tqdm
@@ -151,12 +153,15 @@ class FolderSegmentDataset(Dataset):
     Notes:
     - response is used as query_text
     - channel_0000 and channel_0001 are ignored for text prompt construction
+    - semantic masks are split into multiple instance-like regions using contours
     """
 
-    def __init__(self, data_dir, csv_path, split="train"):
+    def __init__(self, data_dir, csv_path, split="train", resolution=1008, min_instance_area=100):
         self.data_dir = Path(data_dir)
         self.csv_path = Path(csv_path)
         self.split = split
+        self.resolution = resolution
+        self.min_instance_area = min_instance_area
 
         self.split_dir = self.data_dir / split
         self.images_dir = self.split_dir / "images"
@@ -169,7 +174,6 @@ class FolderSegmentDataset(Dataset):
         if not self.csv_path.exists():
             raise FileNotFoundError(f"CSV file not found: {self.csv_path}")
 
-        self.resolution = 1008
         self.transform = v2.Compose([
             v2.ToImage(),
             v2.ToDtype(torch.float32, scale=True),
@@ -243,6 +247,100 @@ class FolderSegmentDataset(Dataset):
     def __len__(self):
         return len(self.samples)
 
+    def _binarize_mask(self, mask: np.ndarray) -> np.ndarray:
+        if mask.max() > 1:
+            return (mask > 127).astype(np.uint8)
+        return (mask > 0).astype(np.uint8)
+
+    def mask_to_bboxes(
+        self,
+        mask: np.ndarray,
+        min_area: int = 100
+    ) -> List[Tuple[float, float, float, float]]:
+        """
+        Convert binary mask to YOLO-format bounding boxes.
+
+        Args:
+            mask: Binary mask (0 and 255 or 0 and 1)
+            min_area: Minimum bbox area threshold for filtering small objects
+
+        Returns:
+            List of bounding boxes in YOLO format:
+            (x_center, y_center, width, height), normalized to [0, 1]
+        """
+        mask = self._binarize_mask(mask)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        bboxes = []
+        height, width = mask.shape
+
+        for contour in contours:
+            x, y, w, h = cv2.boundingRect(contour)
+            if w * h < min_area:
+                continue
+
+            x_center = (x + w / 2.0) / width
+            y_center = (y + h / 2.0) / height
+            width_norm = w / width
+            height_norm = h / height
+
+            x_center = max(0.0, min(1.0, x_center))
+            y_center = max(0.0, min(1.0, y_center))
+            width_norm = max(0.0, min(1.0, width_norm))
+            height_norm = max(0.0, min(1.0, height_norm))
+
+            bboxes.append((x_center, y_center, width_norm, height_norm))
+
+        return bboxes
+
+    def extract_instance_masks(
+        self,
+        mask: np.ndarray,
+        min_area: int = 100
+    ) -> List[Tuple[np.ndarray, Tuple[float, float, float, float]]]:
+        """
+        Split a semantic mask into separate connected-instance masks.
+
+        Args:
+            mask: input binary/gray mask
+            min_area: minimum bbox area threshold
+
+        Returns:
+            List of:
+                (instance_mask, (x_center, y_center, width, height))
+            where bbox is normalized to [0, 1] in original image coordinates
+        """
+        mask = self._binarize_mask(mask)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        height, width = mask.shape
+        instances = []
+
+        for contour in contours:
+            x, y, w, h = cv2.boundingRect(contour)
+            if w * h < min_area:
+                continue
+
+            inst_mask = np.zeros_like(mask, dtype=np.uint8)
+            cv2.drawContours(inst_mask, [contour], contourIdx=-1, color=1, thickness=-1)
+
+            x_center = (x + w / 2.0) / width
+            y_center = (y + h / 2.0) / height
+            width_norm = w / width
+            height_norm = h / height
+
+            x_center = max(0.0, min(1.0, x_center))
+            y_center = max(0.0, min(1.0, y_center))
+            width_norm = max(0.0, min(1.0, width_norm))
+            height_norm = max(0.0, min(1.0, height_norm))
+
+            instances.append((
+                inst_mask,
+                (x_center, y_center, width_norm, height_norm)
+            ))
+
+        return instances
+
     def __getitem__(self, idx):
         sample = self.samples[idx]
         img_id = sample["id"]
@@ -259,7 +357,7 @@ class FolderSegmentDataset(Dataset):
         try:
             mask_image = PILImage.open(mask_path).convert("L")
             mask_np = np.array(mask_image)
-            mask_bin = (mask_np > 0).astype(np.uint8)
+            mask_bin = self._binarize_mask(mask_np)
 
             if mask_bin.sum() == 0:
                 objects = []
@@ -281,61 +379,76 @@ class FolderSegmentDataset(Dataset):
                     )
                 ]
             else:
-                ys, xs = np.where(mask_bin > 0)
-                x_min, x_max = xs.min(), xs.max()
-                y_min, y_max = ys.min(), ys.max()
-
-                x = float(x_min)
-                y = float(y_min)
-                w = float(x_max - x_min + 1)
-                h = float(y_max - y_min + 1)
-
-                cx = x + w / 2.0
-                cy = y + h / 2.0
-
-                scale_w = self.resolution / orig_w
-                scale_h = self.resolution / orig_h
-
-                box_tensor = torch.tensor([
-                    cx * scale_w / self.resolution,
-                    cy * scale_h / self.resolution,
-                    w * scale_w / self.resolution,
-                    h * scale_h / self.resolution,
-                ], dtype=torch.float32)
-
-                mask_t = torch.from_numpy(mask_bin).float().unsqueeze(0).unsqueeze(0)
-                mask_t = torch.nn.functional.interpolate(
-                    mask_t,
-                    size=(self.resolution, self.resolution),
-                    mode="nearest"
+                instances = self.extract_instance_masks(
+                    mask_np,
+                    min_area=self.min_instance_area
                 )
-                segment = mask_t.squeeze() > 0.5
 
-                obj = Object(
-                    bbox=box_tensor,
-                    area=(box_tensor[2] * box_tensor[3]).item(),
-                    object_id=0,
-                    segment=segment
-                )
-                objects = [obj]
+                objects = []
+                object_ids_output = []
 
-                queries = [
-                    FindQueryLoaded(
-                        query_text=response,
-                        image_id=0,
-                        object_ids_output=[0],
-                        is_exhaustive=True,
-                        query_processing_order=0,
-                        inference_metadata=InferenceMetadata(
-                            coco_image_id=img_id,
-                            original_image_id=img_id,
-                            original_category_id=0,
-                            original_size=(orig_h, orig_w),
-                            object_id=-1,
-                            frame_index=-1
-                        )
+                for obj_id, (inst_mask, bbox_norm) in enumerate(instances):
+                    cx, cy, w, h = bbox_norm
+
+                    box_tensor = torch.tensor(
+                        [cx, cy, w, h],
+                        dtype=torch.float32
                     )
-                ]
+
+                    mask_t = torch.from_numpy(inst_mask).float().unsqueeze(0).unsqueeze(0)
+                    mask_t = torch.nn.functional.interpolate(
+                        mask_t,
+                        size=(self.resolution, self.resolution),
+                        mode="nearest"
+                    )
+                    segment = mask_t.squeeze(0).squeeze(0) > 0.5
+
+                    obj = Object(
+                        bbox=box_tensor,
+                        area=(box_tensor[2] * box_tensor[3]).item(),
+                        object_id=obj_id,
+                        segment=segment
+                    )
+                    objects.append(obj)
+                    object_ids_output.append(obj_id)
+
+                # fallback: if all small objects were filtered out
+                if len(objects) == 0:
+                    queries = [
+                        FindQueryLoaded(
+                            query_text=response,
+                            image_id=0,
+                            object_ids_output=[],
+                            is_exhaustive=True,
+                            query_processing_order=0,
+                            inference_metadata=InferenceMetadata(
+                                coco_image_id=img_id,
+                                original_image_id=img_id,
+                                original_category_id=0,
+                                original_size=(orig_h, orig_w),
+                                object_id=-1,
+                                frame_index=-1
+                            )
+                        )
+                    ]
+                else:
+                    queries = [
+                        FindQueryLoaded(
+                            query_text=response,
+                            image_id=0,
+                            object_ids_output=object_ids_output,
+                            is_exhaustive=True,
+                            query_processing_order=0,
+                            inference_metadata=InferenceMetadata(
+                                coco_image_id=img_id,
+                                original_image_id=img_id,
+                                original_category_id=0,
+                                original_size=(orig_h, orig_w),
+                                object_id=-1,
+                                frame_index=-1
+                            )
+                        )
+                    ]
 
         except Exception as e:
             print(f"Warning: Error processing sample {img_path}: {e}")
@@ -369,8 +482,7 @@ class FolderSegmentDataset(Dataset):
             images=[image_obj],
             raw_images=[pil_image]
         )
-
-
+    
 # ============================================================================
 # Optional Eval Helpers
 # ============================================================================
@@ -585,6 +697,8 @@ class SAM3TrainerNative:
             data_dir=data_dir,
             csv_path=self.args.train_csv_path,
             split="train",
+            resolution=self.args.resolution,
+            min_instance_area=self.args.min_instance_area,
         )
 
         has_validation = False
@@ -597,6 +711,8 @@ class SAM3TrainerNative:
                     data_dir=data_dir,
                     csv_path=self.args.val_csv_path,
                     split="val",
+                    resolution=self.args.resolution,
+                    min_instance_area=self.args.min_instance_area,
                 )
                 if len(val_ds) > 0:
                     has_validation = True
@@ -1041,6 +1157,18 @@ def build_parser():
     parser.add_argument("--gradient_accumulation_steps", type=int, default=8)
     parser.add_argument("--train_csv_path", type=str, required=True, help="Path to training CSV file")
     parser.add_argument("--val_csv_path", type=str, default=None, help="Path to validation CSV file")
+    parser.add_argument(
+        "--min_instance_area",
+        type=int,
+        default=100,
+        help="Minimum area threshold for filtering small mask instances when converting semantic masks to multiple bounding boxes"
+    )
+    parser.add_argument(
+        "--resolution",
+        type=int,
+        default=1008,
+        help="Input image and mask resize resolution"
+    )
 
     # Output
     parser.add_argument("--output_dir", type=str, default="outputs/sam3_lora_full")
