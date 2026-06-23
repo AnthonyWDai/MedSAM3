@@ -185,7 +185,7 @@ class FolderSegmentDataset(Dataset):
     Dataset for segmentation data with multiple CSV prompt files.
 
     Expected CSV columns in each file:
-        split,label,case_id,channel_0000,channel_0001,response
+        split,patient_id,case_id,channel_0000,channel_0001,response
 
     Expected CSV filename pattern:
         {split}_i{n}_r{n}_p{n}.csv
@@ -196,7 +196,7 @@ class FolderSegmentDataset(Dataset):
 
     Behavior:
     - loads all CSV files matching the split pattern
-    - merges rows by (label, case_id)
+    - merges rows by (patient_id, case_id)
     - stores all valid responses for each sample
     - randomly samples one response in __getitem__
     """
@@ -267,16 +267,16 @@ class FolderSegmentDataset(Dataset):
 
         return files
 
-    def _resolve_image_and_mask_paths(self, label, case_id):
-        class_img_dir = self.images_dir / label
-        class_mask_dir = self.masks_dir / label
+    def _resolve_image_and_mask_paths(self, patient_id, case_id):
+        class_img_dir = self.images_dir / patient_id
+        class_mask_dir = self.masks_dir / patient_id
 
         if not class_img_dir.exists():
-            print(f"Warning: image directory missing for label '{label}': {class_img_dir}")
+            print(f"Warning: image directory missing for patient_id '{patient_id}': {class_img_dir}")
             return None, None
 
         if not class_mask_dir.exists():
-            print(f"Warning: mask directory missing for label '{label}': {class_mask_dir}")
+            print(f"Warning: mask directory missing for patient_id '{patient_id}': {class_mask_dir}")
             return None, None
 
         candidate_images = [
@@ -304,7 +304,7 @@ class FolderSegmentDataset(Dataset):
     def _load_samples_from_multiple_csvs(self):
         csv_files = self._find_csv_files()
 
-        # key: (label, case_id) -> sample info + all responses
+        # key: (patient_id, case_id) -> sample info + all responses
         merged = {}
         sample_id = 0
 
@@ -312,7 +312,7 @@ class FolderSegmentDataset(Dataset):
             with open(csv_file, "r", newline="", encoding="utf-8") as f:
                 reader = csv.DictReader(f)
 
-                required_cols = {"split", "label", "case_id", "response"}
+                required_cols = {"split", "patient_id", "case_id", "response"}
                 if reader.fieldnames is None:
                     print(f"Warning: CSV has no header, skipping: {csv_file}")
                     continue
@@ -327,27 +327,27 @@ class FolderSegmentDataset(Dataset):
                     if row_split != self.split:
                         continue
 
-                    label = str(row["label"]).strip()
+                    patient_id = str(row["patient_id"]).strip()
                     case_id = str(row["case_id"]).strip()
                     response = str(row["response"]).strip() if row["response"] is not None else ""
 
-                    key = (label, case_id)
+                    key = (patient_id, case_id)
 
                     if key not in merged:
-                        img_path, mask_path = self._resolve_image_and_mask_paths(label, case_id)
+                        img_path, mask_path = self._resolve_image_and_mask_paths(patient_id, case_id)
 
                         if img_path is None:
-                            print(f"Warning: no image found for case_id={case_id}, label={label}")
+                            print(f"Warning: no image found for case_id={case_id}, patient_id={patient_id}")
                             continue
                         if mask_path is None:
-                            print(f"Warning: no mask found for case_id={case_id}, label={label}")
+                            print(f"Warning: no mask found for case_id={case_id}, patient_id={patient_id}")
                             continue
 
                         merged[key] = {
                             "id": sample_id,
                             "image_path": img_path,
                             "mask_path": mask_path,
-                            "label": label,
+                            "patient_id": patient_id,
                             "case_id": case_id,
                             "responses": [],
                         }
@@ -359,7 +359,7 @@ class FolderSegmentDataset(Dataset):
         samples = []
         for key, sample in merged.items():
             if len(sample["responses"]) == 0:
-                sample["responses"] = [f"find {sample['label'].strip().lower()}"]
+                sample["responses"] = [f"find {sample['patient_id'].strip().lower()}"]
             samples.append(sample)
 
         return samples

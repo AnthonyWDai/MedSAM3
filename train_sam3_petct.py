@@ -183,7 +183,7 @@ class FolderSegmentDataset(Dataset):
     Dataset for segmentation data with text prompts read from CSV.
 
     Expected CSV columns:
-        split,label,case_id,channel_0000,channel_0001,response
+        split,patient_id,case_id,channel_0000,channel_0001,response
 
     Notes:
     - response is used as query_text when query_text_mode='csv'
@@ -233,18 +233,18 @@ class FolderSegmentDataset(Dataset):
                 if row["split"] != split:
                     continue
 
-                label = row["label"]
+                patient_id = row["patient_id"]
                 case_id = row["case_id"]
                 response = row["response"].strip() if row["response"] is not None else ""
 
-                class_img_dir = self.images_dir / label
-                class_mask_dir = self.masks_dir / label
+                class_img_dir = self.images_dir / patient_id
+                class_mask_dir = self.masks_dir / patient_id
 
                 if not class_img_dir.exists():
-                    print(f"Warning: image directory missing for label '{label}': {class_img_dir}")
+                    print(f"Warning: image directory missing for patient_id '{patient_id}': {class_img_dir}")
                     continue
                 if not class_mask_dir.exists():
-                    print(f"Warning: mask directory missing for label '{label}': {class_mask_dir}")
+                    print(f"Warning: mask directory missing for patient_id '{patient_id}': {class_mask_dir}")
                     continue
 
                 candidate_images = [
@@ -268,18 +268,18 @@ class FolderSegmentDataset(Dataset):
                 mask_path = next((p for p in candidate_masks if p.exists()), None)
 
                 if img_path is None:
-                    print(f"Warning: no image found for case_id={case_id}, label={label}")
+                    print(f"Warning: no image found for case_id={case_id}, patient_id={patient_id}")
                     continue
 
                 if mask_path is None:
-                    print(f"Warning: no mask found for case_id={case_id}, label={label}")
+                    print(f"Warning: no mask found for case_id={case_id}, patient_id={patient_id}")
                     continue
 
                 self.samples.append({
                     "id": sample_id,
                     "image_path": img_path,
                     "mask_path": mask_path,
-                    "label": label,
+                    "patient_id": patient_id,
                     "case_id": case_id,
                     "response": response,
                 })
