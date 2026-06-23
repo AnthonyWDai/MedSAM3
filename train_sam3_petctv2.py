@@ -520,7 +520,7 @@ class FolderSegmentDataset(Dataset):
         fallback_text = response if self.query_text_mode == "csv" else f"no {str(label).strip().lower()}"
 
         try:
-            mask_image = PILImage.open(mask_path).convert("L")
+            mask_image = PILImage.open(mask_path)
             mask_np = np.array(mask_image)
             mask_bin = self._binarize_mask(mask_np)
 

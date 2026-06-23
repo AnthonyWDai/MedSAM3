@@ -388,7 +388,7 @@ class FolderSegmentDataset(Dataset):
         resized_image = pil_image.resize((self.resolution, self.resolution), PILImage.BILINEAR)
         image_tensor = self.transform(resized_image)
 
-        mask_image = PILImage.open(mask_path).convert("L")
+        mask_image = PILImage.open(mask_path)
         mask_np = np.array(mask_image)
         mask_bin = self._binarize_mask(mask_np)
 
@@ -1040,4 +1040,10 @@ def main():
 
 
 if __name__ == "__main__":
+    # python3 train_sam3_petctv3.py \
+    # --data_dir /workspace/data \
+    # --output_dir outputs/sam3_lora_full \
+    # --device 0 \
+    # --batch_size 4 \
+    # --num_epochs 100
     main()
