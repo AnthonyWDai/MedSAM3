@@ -27,6 +27,7 @@ Examples:
       --val_csv_path /workspace/data/val.csv
 """
 
+import re
 import os
 import csv
 import sys
@@ -178,17 +179,26 @@ def launch_distributed_training(args):
 # Dataset
 # ============================================================================
 
+
 class FolderSegmentDataset(Dataset):
     """
-    Dataset for segmentation data with text prompts read from CSV.
+    Dataset for segmentation data with multiple CSV prompt files.
 
-    Expected CSV columns:
+    Expected CSV columns in each file:
         split,label,case_id,channel_0000,channel_0001,response
 
-    Notes:
-    - response is used as query_text when query_text_mode='csv'
-    - channel_0000 and channel_0001 are ignored for text prompt construction
-    - semantic masks are split into multiple instance-like regions using contours
+    Expected CSV filename pattern:
+        {split}_i{n}_r{n}_p{n}.csv
+    examples:
+        train_i0_r0_p0.csv
+        train_i1_r2_p3.csv
+        val_i0_r0_p0.csv
+
+    Behavior:
+    - loads all CSV files matching the split pattern
+    - merges rows by (label, case_id)
+    - stores all valid responses for each sample
+    - randomly samples one response in __getitem__
     """
 
     def __init__(
@@ -216,7 +226,7 @@ class FolderSegmentDataset(Dataset):
         if not self.masks_dir.exists():
             raise FileNotFoundError(f"Masks directory not found: {self.masks_dir}")
         if not self.csv_path.exists():
-            raise FileNotFoundError(f"CSV file not found: {self.csv_path}")
+            raise FileNotFoundError(f"CSV path not found: {self.csv_path}")
 
         self.transform = v2.Compose([
             v2.ToImage(),
@@ -224,70 +234,135 @@ class FolderSegmentDataset(Dataset):
             v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
         ])
 
-        self.samples = []
-        with open(self.csv_path, "r", newline="", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            sample_id = 0
-
-            for row in reader:
-                if row["split"] != split:
-                    continue
-
-                label = row["label"]
-                case_id = row["case_id"]
-                response = row["response"].strip() if row["response"] is not None else ""
-
-                class_img_dir = self.images_dir / label
-                class_mask_dir = self.masks_dir / label
-
-                if not class_img_dir.exists():
-                    print(f"Warning: image directory missing for label '{label}': {class_img_dir}")
-                    continue
-                if not class_mask_dir.exists():
-                    print(f"Warning: mask directory missing for label '{label}': {class_mask_dir}")
-                    continue
-
-                candidate_images = [
-                    class_img_dir / f"{case_id}.png",
-                    class_img_dir / f"{case_id}.jpg",
-                    class_img_dir / f"{case_id}.jpeg",
-                    class_img_dir / f"{case_id}.bmp",
-                    class_img_dir / f"{case_id}.tif",
-                    class_img_dir / f"{case_id}.tiff",
-                ]
-                img_path = next((p for p in candidate_images if p.exists()), None)
-
-                candidate_masks = [
-                    class_mask_dir / f"{case_id}.png",
-                    class_mask_dir / f"{case_id}.jpg",
-                    class_mask_dir / f"{case_id}.jpeg",
-                    class_mask_dir / f"{case_id}.bmp",
-                    class_mask_dir / f"{case_id}.tif",
-                    class_mask_dir / f"{case_id}.tiff",
-                ]
-                mask_path = next((p for p in candidate_masks if p.exists()), None)
-
-                if img_path is None:
-                    print(f"Warning: no image found for case_id={case_id}, label={label}")
-                    continue
-
-                if mask_path is None:
-                    print(f"Warning: no mask found for case_id={case_id}, label={label}")
-                    continue
-
-                self.samples.append({
-                    "id": sample_id,
-                    "image_path": img_path,
-                    "mask_path": mask_path,
-                    "label": label,
-                    "case_id": case_id,
-                    "response": response,
-                })
-                sample_id += 1
+        self.samples = self._load_samples_from_multiple_csvs()
 
         print(f"Loaded CSV-driven dataset: {split} split")
         print(f"  Samples: {len(self.samples)}")
         print(f"  query_text_mode: {self.query_text_mode}")
+
+    def _find_csv_files(self):
+        """
+        Find all CSV files matching:
+            {split}_i{n}_r{n}_p{n}.csv
+        """
+        pattern = re.compile(rf"^{self.split}_i\d+_r\d+_p\d+\.csv$")
+
+        if self.csv_path.is_file():
+            files = [self.csv_path] if pattern.match(self.csv_path.name) else []
+        else:
+            files = sorted([
+                p for p in self.csv_path.iterdir()
+                if p.is_file() and pattern.match(p.name)
+            ])
+
+        if len(files) == 0:
+            raise FileNotFoundError(
+                f"No CSV files found for split='{self.split}' under {self.csv_path} "
+                f"with pattern '{self.split}_i<n>_r<n>_p<n>.csv'"
+            )
+
+        print(f"Found {len(files)} CSV files for split='{self.split}':")
+        for f in files:
+            print(f"  - {f}")
+
+        return files
+
+    def _resolve_image_and_mask_paths(self, label, case_id):
+        class_img_dir = self.images_dir / label
+        class_mask_dir = self.masks_dir / label
+
+        if not class_img_dir.exists():
+            print(f"Warning: image directory missing for label '{label}': {class_img_dir}")
+            return None, None
+
+        if not class_mask_dir.exists():
+            print(f"Warning: mask directory missing for label '{label}': {class_mask_dir}")
+            return None, None
+
+        candidate_images = [
+            class_img_dir / f"{case_id}.png",
+            class_img_dir / f"{case_id}.jpg",
+            class_img_dir / f"{case_id}.jpeg",
+            class_img_dir / f"{case_id}.bmp",
+            class_img_dir / f"{case_id}.tif",
+            class_img_dir / f"{case_id}.tiff",
+        ]
+        img_path = next((p for p in candidate_images if p.exists()), None)
+
+        candidate_masks = [
+            class_mask_dir / f"{case_id}.png",
+            class_mask_dir / f"{case_id}.jpg",
+            class_mask_dir / f"{case_id}.jpeg",
+            class_mask_dir / f"{case_id}.bmp",
+            class_mask_dir / f"{case_id}.tif",
+            class_mask_dir / f"{case_id}.tiff",
+        ]
+        mask_path = next((p for p in candidate_masks if p.exists()), None)
+
+        return img_path, mask_path
+
+    def _load_samples_from_multiple_csvs(self):
+        csv_files = self._find_csv_files()
+
+        # key: (label, case_id) -> sample info + all responses
+        merged = {}
+        sample_id = 0
+
+        for csv_file in csv_files:
+            with open(csv_file, "r", newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+
+                required_cols = {"split", "label", "case_id", "response"}
+                if reader.fieldnames is None:
+                    print(f"Warning: CSV has no header, skipping: {csv_file}")
+                    continue
+
+                missing = required_cols - set(reader.fieldnames)
+                if missing:
+                    print(f"Warning: CSV missing columns {missing}, skipping: {csv_file}")
+                    continue
+
+                for row in reader:
+                    row_split = str(row.get("split", "")).strip()
+                    if row_split != self.split:
+                        continue
+
+                    label = str(row["label"]).strip()
+                    case_id = str(row["case_id"]).strip()
+                    response = str(row["response"]).strip() if row["response"] is not None else ""
+
+                    key = (label, case_id)
+
+                    if key not in merged:
+                        img_path, mask_path = self._resolve_image_and_mask_paths(label, case_id)
+
+                        if img_path is None:
+                            print(f"Warning: no image found for case_id={case_id}, label={label}")
+                            continue
+                        if mask_path is None:
+                            print(f"Warning: no mask found for case_id={case_id}, label={label}")
+                            continue
+
+                        merged[key] = {
+                            "id": sample_id,
+                            "image_path": img_path,
+                            "mask_path": mask_path,
+                            "label": label,
+                            "case_id": case_id,
+                            "responses": [],
+                        }
+                        sample_id += 1
+
+                    if response:
+                        merged[key]["responses"].append(response)
+
+        samples = []
+        for key, sample in merged.items():
+            if len(sample["responses"]) == 0:
+                sample["responses"] = [f"find {sample['label'].strip().lower()}"]
+            samples.append(sample)
+
+        return samples
 
     def __len__(self):
         return len(self.samples)
@@ -302,17 +377,6 @@ class FolderSegmentDataset(Dataset):
         mask: np.ndarray,
         min_area: int = 100
     ) -> List[Tuple[float, float, float, float]]:
-        """
-        Convert binary mask to YOLO-format bounding boxes.
-
-        Args:
-            mask: Binary mask (0 and 255 or 0 and 1)
-            min_area: Minimum bbox area threshold for filtering small objects
-
-        Returns:
-            List of bounding boxes in YOLO format:
-            (x_center, y_center, width, height), normalized to [0, 1]
-        """
         mask = self._binarize_mask(mask)
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
@@ -343,18 +407,6 @@ class FolderSegmentDataset(Dataset):
         mask: np.ndarray,
         min_area: int = 100
     ) -> List[Tuple[np.ndarray, Tuple[float, float, float, float]]]:
-        """
-        Split a semantic mask into separate connected-instance masks.
-
-        Args:
-            mask: input binary/gray mask
-            min_area: minimum bbox area threshold
-
-        Returns:
-            List of:
-                (instance_mask, (x_center, y_center, width, height))
-            where bbox is normalized to [0, 1] in original image coordinates
-        """
         mask = self._binarize_mask(mask)
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
@@ -454,8 +506,10 @@ class FolderSegmentDataset(Dataset):
         img_id = sample["id"]
         img_path = sample["image_path"]
         mask_path = sample["mask_path"]
-        response = sample["response"]
         label = sample["label"]
+
+        responses = sample.get("responses", [])
+        response = random.choice(responses) if len(responses) > 0 else ""
 
         pil_image = PILImage.open(img_path).convert("RGB")
         orig_w, orig_h = pil_image.size
@@ -485,10 +539,7 @@ class FolderSegmentDataset(Dataset):
                 for obj_id, (inst_mask, bbox_norm) in enumerate(instances):
                     cx, cy, w, h = bbox_norm
 
-                    box_tensor = torch.tensor(
-                        [cx, cy, w, h],
-                        dtype=torch.float32
-                    )
+                    box_tensor = torch.tensor([cx, cy, w, h], dtype=torch.float32)
 
                     mask_t = torch.from_numpy(inst_mask).float().unsqueeze(0).unsqueeze(0)
                     mask_t = torch.nn.functional.interpolate(
@@ -507,7 +558,6 @@ class FolderSegmentDataset(Dataset):
                     objects.append(obj)
                     object_ids_output.append(obj_id)
 
-                # fallback: if all small objects were filtered out
                 if len(objects) == 0:
                     queries = self._build_fallback_query(fallback_text, img_id, orig_h, orig_w)
                 else:
@@ -529,36 +579,25 @@ class FolderSegmentDataset(Dataset):
                                 )
                             )
                         ]
-                    elif self.query_text_mode == "auto_simple":
-                        object_class_names = [label] * len(objects)
+                    else:
                         queries = self.build_simple_queries(
                             objects=objects,
-                            object_class_names=object_class_names,
+                            object_class_names=[label] * len(objects),
                             image_id=0,
                             img_id=img_id,
                             orig_h=orig_h,
                             orig_w=orig_w,
                         )
-                    else:
-                        raise ValueError(f"Unsupported query_text_mode: {self.query_text_mode}")
 
         except Exception as e:
-            print(f"Warning: Error processing sample {img_path}: {e}")
+            print(f"Warning: failed processing sample idx={idx}, image={img_path}, mask={mask_path}: {e}")
             objects = []
             queries = self._build_fallback_query(fallback_text, img_id, orig_h, orig_w)
 
-        image_obj = Image(
-            data=image_tensor,
-            objects=objects,
-            size=(self.resolution, self.resolution)
-        )
+        image = Image(image=image_tensor, objects=objects)
+        datapoint = Datapoint(image=image, queries=queries)
 
-        return Datapoint(
-            find_queries=queries,
-            images=[image_obj],
-            raw_images=[pil_image]
-        )
-
+        return {"input": datapoint}
 
 # ============================================================================
 # Optional Eval Helpers
