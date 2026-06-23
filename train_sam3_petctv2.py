@@ -506,7 +506,7 @@ class FolderSegmentDataset(Dataset):
         img_id = sample["id"]
         img_path = sample["image_path"]
         mask_path = sample["mask_path"]
-        label = sample["label"]
+        label = "lesion" # change for your task
 
         responses = sample.get("responses", [])
         response = random.choice(responses) if len(responses) > 0 else ""
@@ -517,7 +517,7 @@ class FolderSegmentDataset(Dataset):
         resized_image = pil_image.resize((self.resolution, self.resolution), PILImage.BILINEAR)
         image_tensor = self.transform(resized_image)
 
-        fallback_text = response if self.query_text_mode == "csv" else f"find {str(label).strip().lower()}"
+        fallback_text = response if self.query_text_mode == "csv" else f"no {str(label).strip().lower()}"
 
         try:
             mask_image = PILImage.open(mask_path).convert("L")
