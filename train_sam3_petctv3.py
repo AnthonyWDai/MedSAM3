@@ -431,19 +431,17 @@ class FolderSegmentDataset(Dataset):
             orig_w=orig_w,
         )
 
-        image = Image(
-            image=image_tensor,
-            image_id=img_id,
-            original_size=(orig_h, orig_w),
-        )
-
-        datapoint = Datapoint(
-            image=image,
+        image_obj = Image(
+            data=image_tensor,
             objects=objects,
-            find_queries=queries,
+            size=(self.resolution, self.resolution),
         )
 
-        return {"input": datapoint}
+        return Datapoint(
+            find_queries=queries,
+            images=[image_obj],
+            raw_images=[pil_image]
+        )
 
 
 # ============================================================================

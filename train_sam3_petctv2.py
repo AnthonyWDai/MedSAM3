@@ -594,10 +594,13 @@ class FolderSegmentDataset(Dataset):
             objects = []
             queries = self._build_fallback_query(fallback_text, img_id, orig_h, orig_w)
 
-        image = Image(image=image_tensor, objects=objects)
-        datapoint = Datapoint(image=image, queries=queries)
+        image_obj = Image(data=image_tensor, objects=objects, size=(self.resolution, self.resolution))
 
-        return {"input": datapoint}
+        return Datapoint(
+            find_queries=queries,
+            images=[image_obj],
+            raw_images=[pil_image]
+        )
 
 # ============================================================================
 # Optional Eval Helpers
