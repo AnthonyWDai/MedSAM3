@@ -392,7 +392,7 @@ class FolderSegmentDataset(Dataset):
         pil_image = PILImage.open(img_path).convert("RGB")
         orig_w, orig_h = pil_image.size
 
-        resized_image = pil_image.resize((self.resolution, self.resolution), PILImage.BILINEAR)
+        resized_image = pil_image.resize((self.resolution, self.resolution), PILImage.BICUBIC)
         image_tensor = self.transform(resized_image)
 
         mask_image = PILImage.open(mask_path)

@@ -514,7 +514,7 @@ class FolderSegmentDataset(Dataset):
         pil_image = PILImage.open(img_path).convert("RGB")
         orig_w, orig_h = pil_image.size
 
-        resized_image = pil_image.resize((self.resolution, self.resolution), PILImage.BILINEAR)
+        resized_image = pil_image.resize((self.resolution, self.resolution), PILImage.BICUBIC)
         image_tensor = self.transform(resized_image)
 
         fallback_text = response if self.query_text_mode == "csv" else f"no {str(label).strip().lower()}"
