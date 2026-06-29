@@ -36,6 +36,8 @@ import numpy as np
 from PIL import Image as PILImage
 from tqdm import tqdm
 
+import albumentations as A
+
 import torch
 import torch.distributed as dist
 from torch.optim import AdamW
@@ -195,6 +197,7 @@ def compute_seg_dice_stats(pred: torch.Tensor, target: torch.Tensor, num_classes
 # Dataset
 # ============================================================================
 
+
 class FolderSegmentDataset(Dataset):
     """
     Folder-based segmentation dataset.
@@ -238,11 +241,50 @@ class FolderSegmentDataset(Dataset):
         if not self.masks_dir.exists():
             raise FileNotFoundError(f"Masks directory not found: {self.masks_dir}")
 
-        self.transform = v2.Compose([
-            v2.ToImage(),
-            v2.ToDtype(torch.float32, scale=True),
-            v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+        self.train_transform = A.Compose([
+            A.LongestMaxSize(
+                max_size=self.resolution, 
+                interpolation=cv2.INTER_CUBIC,
+                mask_interpolation=cv2.INTER_NEAREST,
+            ),
+            A.PadIfNeeded(
+                min_height=self.resolution,
+                min_width=self.resolution,
+                border_mode=cv2.BORDER_CONSTANT,
+                fill=(0, 0, 0),
+                fill_mask=0,
+                position="center",
+            ),
+            A.Rotate(
+                limit=10,
+                interpolation=cv2.INTER_CUBIC,
+                mask_interpolation=cv2.INTER_NEAREST,
+                border_mode=cv2.BORDER_CONSTANT,
+                fill=(0, 0, 0),
+                fill_mask=0,
+                p=0.5,
+            ),
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.5),
         ])
+
+        self.val_transform = A.Compose([
+            A.LongestMaxSize(
+                max_size=self.resolution, 
+                interpolation=cv2.INTER_CUBIC,
+                mask_interpolation=cv2.INTER_NEAREST,
+            ),
+            A.PadIfNeeded(
+                min_height=self.resolution,
+                min_width=self.resolution,
+                border_mode=cv2.BORDER_CONSTANT,
+                fill=(0, 0, 0),
+                fill_mask=0,
+                position="center",
+            ),
+        ])
+
+        self.transform = self.train_transform if split == "train" else self.val_transform
 
         self.samples = []
         sample_id = 0
@@ -275,9 +317,23 @@ class FolderSegmentDataset(Dataset):
         return len(self.samples)
 
     def _binarize_mask(self, mask: np.ndarray) -> np.ndarray:
+        if mask.ndim == 3:
+            mask = mask[..., 0]
         if mask.max() > 1:
             return (mask > 127).astype(np.uint8)
         return (mask > 0).astype(np.uint8)
+
+    def _apply_transform(self, image_np: np.ndarray, mask_np: np.ndarray):
+        transformed = self.transform(image=image_np, mask=mask_np)
+        return transformed["image"], transformed["mask"]
+
+    def _to_image_tensor(self, image_np: np.ndarray) -> torch.Tensor:
+        """
+        Convert HWC uint8 RGB image -> CHW float32 tensor in [0, 1]
+        No normalization.
+        """
+        image_tensor = torch.from_numpy(image_np).permute(2, 0, 1).float() / 255.0
+        return image_tensor
 
     def extract_instance_masks(
         self,
@@ -290,7 +346,7 @@ class FolderSegmentDataset(Dataset):
         Returns:
             List of:
               (instance_mask, (x_center, y_center, width, height))
-            where bbox is normalized to [0, 1] in original image coordinates
+            where bbox is normalized to [0, 1] in transformed image coordinates
         """
         mask = self._binarize_mask(mask)
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -331,8 +387,6 @@ class FolderSegmentDataset(Dataset):
         orig_h,
         orig_w,
     ):
-        # Construct Queries - one per unique category
-        # Each query maps to only the objects of that category
         class_to_object_ids = defaultdict(list)
         for obj, class_name in zip(objects, object_class_names):
             class_to_object_ids[str(class_name).lower()].append(obj.object_id)
@@ -385,34 +439,29 @@ class FolderSegmentDataset(Dataset):
         pil_image = PILImage.open(img_path).convert("RGB")
         orig_w, orig_h = pil_image.size
 
-        resized_image = pil_image.resize((self.resolution, self.resolution), PILImage.BICUBIC)
-        image_tensor = self.transform(resized_image)
-
+        image_np = np.array(pil_image)
         mask_image = PILImage.open(mask_path)
         mask_np = np.array(mask_image)
         mask_bin = self._binarize_mask(mask_np)
+
+        image_np, mask_bin = self._apply_transform(image_np, mask_bin)
+
+        image_tensor = self._to_image_tensor(image_np)
 
         objects = []
         object_class_names = []
 
         if mask_bin.sum() > 0:
             instances = self.extract_instance_masks(
-                mask_np,
+                mask_bin,
                 min_area=self.min_instance_area
             )
 
             for obj_id, (inst_mask, bbox_norm) in enumerate(instances):
                 cx, cy, w, h = bbox_norm
-
                 box_tensor = torch.tensor([cx, cy, w, h], dtype=torch.float32)
 
-                mask_t = torch.from_numpy(inst_mask).float().unsqueeze(0).unsqueeze(0)
-                mask_t = torch.nn.functional.interpolate(
-                    mask_t,
-                    size=(self.resolution, self.resolution),
-                    mode="nearest"
-                )
-                segment = mask_t.squeeze(0).squeeze(0) > 0.5
+                segment = torch.from_numpy(inst_mask.astype(np.uint8)).bool()
 
                 obj = Object(
                     bbox=box_tensor,
@@ -442,7 +491,7 @@ class FolderSegmentDataset(Dataset):
             images=[image_obj],
             raw_images=[pil_image]
         )
-
+    
 
 # ============================================================================
 # Trainer

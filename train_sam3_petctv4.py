@@ -46,6 +46,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from torchvision.transforms import v2
 
+import albumentations as A
+
 # SAM3 Imports
 from sam3.model_builder import build_sam3_image_model
 from sam3.model.model_misc import SAM3Output
@@ -62,8 +64,6 @@ from sam3.train.data.sam3_image_dataset import (
 )
 
 from lora_layers import LoRAConfig, apply_lora_to_model, save_lora_weights, count_parameters
-
-import albumentations as A
 
 
 # ============================================================================
@@ -286,7 +286,7 @@ class FolderSegmentDataset(Dataset):
                 position="center",
             ),
             A.Rotate(
-                limit=15,
+                limit=10,
                 interpolation=cv2.INTER_CUBIC,
                 mask_interpolation=cv2.INTER_NEAREST,
                 border_mode=cv2.BORDER_CONSTANT,

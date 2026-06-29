@@ -45,6 +45,8 @@ import numpy as np
 from PIL import Image as PILImage
 from tqdm import tqdm
 
+import albumentations as A
+
 import torch
 import torch.distributed as dist
 from torch.optim import AdamW
@@ -201,6 +203,8 @@ class FolderSegmentDataset(Dataset):
     - randomly samples one response in __getitem__
     """
 
+    IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
+
     def __init__(
         self,
         data_dir,
@@ -228,11 +232,9 @@ class FolderSegmentDataset(Dataset):
         if not self.csv_path.exists():
             raise FileNotFoundError(f"CSV path not found: {self.csv_path}")
 
-        self.transform = v2.Compose([
-            v2.ToImage(),
-            v2.ToDtype(torch.float32, scale=True),
-            v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-        ])
+        self.train_transform = self._build_train_transform()
+        self.val_transform = self._build_val_transform()
+        self.transform = self.train_transform if self.split == "train" else self.val_transform
 
         self.samples = self._load_samples_from_multiple_csvs()
 
@@ -240,20 +242,64 @@ class FolderSegmentDataset(Dataset):
         print(f"  Samples: {len(self.samples)}")
         print(f"  query_text_mode: {self.query_text_mode}")
 
+    def _build_train_transform(self):
+        return A.Compose([
+            A.LongestMaxSize(
+                max_size=self.resolution,
+                interpolation=cv2.INTER_CUBIC,
+                mask_interpolation=cv2.INTER_NEAREST,
+                p=1.0,
+            ),
+            A.PadIfNeeded(
+                min_height=self.resolution,
+                min_width=self.resolution,
+                border_mode=cv2.BORDER_CONSTANT,
+                fill=(0, 0, 0),
+                fill_mask=0,
+                position="center",
+                p=1.0,
+            ),
+            A.Rotate(
+                limit=10,
+                interpolation=cv2.INTER_CUBIC,
+                mask_interpolation=cv2.INTER_NEAREST,
+                border_mode=cv2.BORDER_CONSTANT,
+                fill=(0, 0, 0),
+                fill_mask=0,
+                p=0.5,
+            ),
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.5),
+        ])
+
+    def _build_val_transform(self):
+        return A.Compose([
+            A.LongestMaxSize(
+                max_size=self.resolution,
+                interpolation=cv2.INTER_CUBIC,
+                mask_interpolation=cv2.INTER_NEAREST,
+                p=1.0,
+            ),
+            A.PadIfNeeded(
+                min_height=self.resolution,
+                min_width=self.resolution,
+                border_mode=cv2.BORDER_CONSTANT,
+                fill=(0, 0, 0),
+                fill_mask=0,
+                position="center",
+                p=1.0,
+            ),
+        ])
+
     def _find_csv_files(self):
-        """
-        Find all CSV files matching:
-            {split}_i{n}_r{n}_p{n}.csv
-        """
         pattern = re.compile(rf"^{self.split}_i\d+_r\d+_p\d+\.csv$")
 
         if self.csv_path.is_file():
             files = [self.csv_path] if pattern.match(self.csv_path.name) else []
         else:
-            files = sorted([
-                p for p in self.csv_path.iterdir()
-                if p.is_file() and pattern.match(p.name)
-            ])
+            files = sorted(
+                [p for p in self.csv_path.iterdir() if p.is_file() and pattern.match(p.name)]
+            )
 
         if len(files) == 0:
             raise FileNotFoundError(
@@ -268,43 +314,31 @@ class FolderSegmentDataset(Dataset):
         return files
 
     def _resolve_image_and_mask_paths(self, patient_id, case_id):
-        class_img_dir = self.images_dir / patient_id
-        class_mask_dir = self.masks_dir / patient_id
+        image_dir = self.images_dir / patient_id
+        mask_dir = self.masks_dir / patient_id
 
-        if not class_img_dir.exists():
-            print(f"Warning: image directory missing for patient_id '{patient_id}': {class_img_dir}")
+        if not image_dir.exists():
+            print(f"Warning: image directory missing for patient_id '{patient_id}': {image_dir}")
             return None, None
 
-        if not class_mask_dir.exists():
-            print(f"Warning: mask directory missing for patient_id '{patient_id}': {class_mask_dir}")
+        if not mask_dir.exists():
+            print(f"Warning: mask directory missing for patient_id '{patient_id}': {mask_dir}")
             return None, None
 
-        candidate_images = [
-            class_img_dir / f"{case_id}.png",
-            class_img_dir / f"{case_id}.jpg",
-            class_img_dir / f"{case_id}.jpeg",
-            class_img_dir / f"{case_id}.bmp",
-            class_img_dir / f"{case_id}.tif",
-            class_img_dir / f"{case_id}.tiff",
-        ]
-        img_path = next((p for p in candidate_images if p.exists()), None)
-
-        candidate_masks = [
-            class_mask_dir / f"{case_id}.png",
-            class_mask_dir / f"{case_id}.jpg",
-            class_mask_dir / f"{case_id}.jpeg",
-            class_mask_dir / f"{case_id}.bmp",
-            class_mask_dir / f"{case_id}.tif",
-            class_mask_dir / f"{case_id}.tiff",
-        ]
-        mask_path = next((p for p in candidate_masks if p.exists()), None)
+        img_path = next(
+            (image_dir / f"{case_id}{ext}" for ext in self.IMAGE_EXTENSIONS if (image_dir / f"{case_id}{ext}").exists()),
+            None,
+        )
+        mask_path = next(
+            (mask_dir / f"{case_id}{ext}" for ext in self.IMAGE_EXTENSIONS if (mask_dir / f"{case_id}{ext}").exists()),
+            None,
+        )
 
         return img_path, mask_path
 
     def _load_samples_from_multiple_csvs(self):
         csv_files = self._find_csv_files()
 
-        # key: (patient_id, case_id) -> sample info + all responses
         merged = {}
         sample_id = 0
 
@@ -357,7 +391,7 @@ class FolderSegmentDataset(Dataset):
                         merged[key]["responses"].append(response)
 
         samples = []
-        for key, sample in merged.items():
+        for _, sample in merged.items():
             if len(sample["responses"]) == 0:
                 sample["responses"] = [f"find {sample['patient_id'].strip().lower()}"]
             samples.append(sample)
@@ -368,9 +402,22 @@ class FolderSegmentDataset(Dataset):
         return len(self.samples)
 
     def _binarize_mask(self, mask: np.ndarray) -> np.ndarray:
+        if mask.ndim == 3:
+            mask = mask[..., 0]
         if mask.max() > 1:
             return (mask > 127).astype(np.uint8)
         return (mask > 0).astype(np.uint8)
+
+    def _apply_transform(self, image_np: np.ndarray, mask_np: np.ndarray):
+        transformed = self.transform(image=image_np, mask=mask_np)
+        image_np = transformed["image"]
+        mask_np = transformed["mask"]
+        return image_np, mask_np
+
+    def _to_image_tensor(self, image_np: np.ndarray) -> torch.Tensor:
+        # HWC uint8 -> CHW float32 in [0,1], no normalization
+        image_tensor = torch.from_numpy(image_np).permute(2, 0, 1).contiguous().float() / 255.0
+        return image_tensor
 
     def mask_to_bboxes(
         self,
@@ -431,10 +478,7 @@ class FolderSegmentDataset(Dataset):
             width_norm = max(0.0, min(1.0, width_norm))
             height_norm = max(0.0, min(1.0, height_norm))
 
-            instances.append((
-                inst_mask,
-                (x_center, y_center, width_norm, height_norm)
-            ))
+            instances.append((inst_mask, (x_center, y_center, width_norm, height_norm)))
 
         return instances
 
@@ -476,8 +520,8 @@ class FolderSegmentDataset(Dataset):
                         original_category_id=0,
                         original_size=(orig_h, orig_w),
                         object_id=-1,
-                        frame_index=-1
-                    )
+                        frame_index=-1,
+                    ),
                 )
             )
         return queries
@@ -496,8 +540,8 @@ class FolderSegmentDataset(Dataset):
                     original_category_id=0,
                     original_size=(orig_h, orig_w),
                     object_id=-1,
-                    frame_index=-1
-                )
+                    frame_index=-1,
+                ),
             )
         ]
 
@@ -506,16 +550,14 @@ class FolderSegmentDataset(Dataset):
         img_id = sample["id"]
         img_path = sample["image_path"]
         mask_path = sample["mask_path"]
-        label = "lesion" # change for your task
+        label = "lesion"  # change for your task
 
         responses = sample.get("responses", [])
         response = random.choice(responses) if len(responses) > 0 else ""
 
         pil_image = PILImage.open(img_path).convert("RGB")
-        orig_w, orig_h = pil_image.size
-
-        resized_image = pil_image.resize((self.resolution, self.resolution), PILImage.BICUBIC)
-        image_tensor = self.transform(resized_image)
+        image_np = np.array(pil_image)
+        orig_h, orig_w = image_np.shape[:2]
 
         fallback_text = response if self.query_text_mode == "csv" else f"no {str(label).strip().lower()}"
 
@@ -524,12 +566,15 @@ class FolderSegmentDataset(Dataset):
             mask_np = np.array(mask_image)
             mask_bin = self._binarize_mask(mask_np)
 
+            image_np, mask_bin = self._apply_transform(image_np, mask_bin)
+            image_tensor = self._to_image_tensor(image_np)
+
             if mask_bin.sum() == 0:
                 objects = []
                 queries = self._build_fallback_query(fallback_text, img_id, orig_h, orig_w)
             else:
                 instances = self.extract_instance_masks(
-                    mask_np,
+                    mask_bin,
                     min_area=self.min_instance_area
                 )
 
@@ -540,14 +585,7 @@ class FolderSegmentDataset(Dataset):
                     cx, cy, w, h = bbox_norm
 
                     box_tensor = torch.tensor([cx, cy, w, h], dtype=torch.float32)
-
-                    mask_t = torch.from_numpy(inst_mask).float().unsqueeze(0).unsqueeze(0)
-                    mask_t = torch.nn.functional.interpolate(
-                        mask_t,
-                        size=(self.resolution, self.resolution),
-                        mode="nearest"
-                    )
-                    segment = mask_t.squeeze(0).squeeze(0) > 0.5
+                    segment = torch.from_numpy(inst_mask > 0).bool()
 
                     obj = Object(
                         bbox=box_tensor,
@@ -575,8 +613,8 @@ class FolderSegmentDataset(Dataset):
                                     original_category_id=0,
                                     original_size=(orig_h, orig_w),
                                     object_id=-1,
-                                    frame_index=-1
-                                )
+                                    frame_index=-1,
+                                ),
                             )
                         ]
                     else:
@@ -591,16 +629,30 @@ class FolderSegmentDataset(Dataset):
 
         except Exception as e:
             print(f"Warning: failed processing sample idx={idx}, image={img_path}, mask={mask_path}: {e}")
+
+            # still return transformed image if possible
+            try:
+                image_np, _ = self._apply_transform(image_np, np.zeros((orig_h, orig_w), dtype=np.uint8))
+                image_tensor = self._to_image_tensor(image_np)
+            except Exception:
+                image_resized = cv2.resize(image_np, (self.resolution, self.resolution), interpolation=cv2.INTER_CUBIC)
+                image_tensor = self._to_image_tensor(image_resized)
+
             objects = []
             queries = self._build_fallback_query(fallback_text, img_id, orig_h, orig_w)
 
-        image_obj = Image(data=image_tensor, objects=objects, size=(self.resolution, self.resolution))
+        image_obj = Image(
+            data=image_tensor,
+            objects=objects,
+            size=(self.resolution, self.resolution),
+        )
 
         return Datapoint(
             find_queries=queries,
             images=[image_obj],
-            raw_images=[pil_image]
+            raw_images=[pil_image],
         )
+
 
 # ============================================================================
 # Optional Eval Helpers
