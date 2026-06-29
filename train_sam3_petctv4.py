@@ -63,6 +63,8 @@ from sam3.train.data.sam3_image_dataset import (
 
 from lora_layers import LoRAConfig, apply_lora_to_model, save_lora_weights, count_parameters
 
+import albumentations as A
+
 
 # ============================================================================
 # Prompt Pool
@@ -228,10 +230,20 @@ class FolderSegmentDataset(Dataset):
           masks/
             same relative paths / filenames as images
 
+    Train transform:
+      - LongestMaxSize
+      - PadIfNeeded
+      - Random rotation
+      - Horizontal / vertical flip
+
+    Val transform:
+      - LongestMaxSize
+      - PadIfNeeded
+
     Notes:
-      - No CSV reading
-      - Queries are built from mask-derived objects
-      - Query text is randomly sampled from a prompt pool
+      - No normalization
+      - All extracted objects get class name `default_label`
+      - Queries are built from unique class names mapped to object IDs
     """
 
     IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
@@ -242,16 +254,13 @@ class FolderSegmentDataset(Dataset):
         split="train",
         resolution=1008,
         min_instance_area=100,
-        prompt_pool=None,
+        default_label="lesion",
     ):
         self.data_dir = Path(data_dir)
         self.split = split
         self.resolution = resolution
         self.min_instance_area = min_instance_area
-        self.prompt_pool = prompt_pool if prompt_pool is not None else list(DEFAULT_TEXT_PROMPTS)
-
-        if len(self.prompt_pool) == 0:
-            raise ValueError("prompt_pool must contain at least one text prompt")
+        self.default_label = str(default_label).strip().lower() or "lesion"
 
         self.split_dir = self.data_dir / split
         self.images_dir = self.split_dir / "images"
@@ -262,10 +271,47 @@ class FolderSegmentDataset(Dataset):
         if not self.masks_dir.exists():
             raise FileNotFoundError(f"Masks directory not found: {self.masks_dir}")
 
-        self.transform = v2.Compose([
-            v2.ToImage(),
-            v2.ToDtype(torch.float32, scale=True),
-            v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+        self.train_transform = A.Compose([
+            A.LongestMaxSize(
+                max_size=self.resolution, 
+                interpolation=cv2.INTER_CUBIC,
+                mask_interpolation=cv2.INTER_NEAREST,
+            ),
+            A.PadIfNeeded(
+                min_height=self.resolution,
+                min_width=self.resolution,
+                border_mode=cv2.BORDER_CONSTANT,
+                fill=0,
+                fill_mask=0,
+                position="center",
+            ),
+            A.Rotate(
+                limit=15,
+                interpolation=cv2.INTER_CUBIC,
+                mask_interpolation=cv2.INTER_NEAREST,
+                border_mode=cv2.BORDER_CONSTANT,
+                fill=0,
+                fill_mask=0,
+                p=0.5,
+            ),
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.5),
+        ])
+
+        self.val_transform = A.Compose([
+            A.LongestMaxSize(
+                max_size=self.resolution, 
+                interpolation=cv2.INTER_CUBIC,
+                mask_interpolation=cv2.INTER_NEAREST,
+            ),
+            A.PadIfNeeded(
+                min_height=self.resolution,
+                min_width=self.resolution,
+                border_mode=cv2.BORDER_CONSTANT,
+                fill=0,
+                fill_mask=0,
+                position="center",
+            ),
         ])
 
         self.samples = []
@@ -293,15 +339,29 @@ class FolderSegmentDataset(Dataset):
 
         print(f"Loaded folder dataset: {split} split")
         print(f"  Samples: {len(self.samples)}")
-        print(f"  Prompt count: {len(self.prompt_pool)}")
+        print(f"  Default label: {self.default_label}")
 
     def __len__(self):
         return len(self.samples)
 
+    def _get_transform(self):
+        if self.split == "train":
+            return self.train_transform
+        return self.val_transform
+
     def _binarize_mask(self, mask: np.ndarray) -> np.ndarray:
+        if mask.ndim == 3:
+            mask = mask[..., 0]
         if mask.max() > 1:
             return (mask > 127).astype(np.uint8)
         return (mask > 0).astype(np.uint8)
+
+    def _to_tensor_image(self, image_np: np.ndarray) -> torch.Tensor:
+        """
+        Convert HWC uint8 RGB image to CHW float32 tensor in [0, 1].
+        No normalization.
+        """
+        return torch.from_numpy(image_np).permute(2, 0, 1).float() / 255.0
 
     def extract_instance_masks(
         self,
@@ -314,7 +374,7 @@ class FolderSegmentDataset(Dataset):
         Returns:
             List of:
               (instance_mask, (x_center, y_center, width, height))
-            where bbox is normalized to [0, 1] in original image coordinates
+            where bbox is normalized to [0, 1] in transformed image coordinates
         """
         mask = self._binarize_mask(mask)
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -347,41 +407,56 @@ class FolderSegmentDataset(Dataset):
 
         return instances
 
-    def sample_prompt(self) -> str:
-        return random.choice(self.prompt_pool)
-
-    def build_random_prompt_query(
+    def build_simple_queries(
         self,
         objects,
+        object_class_names,
         img_id,
         orig_h,
         orig_w,
     ):
-        """
-        Build a single query using a randomly selected text prompt.
+        class_to_object_ids = defaultdict(list)
+        for obj, class_name in zip(objects, object_class_names):
+            class_to_object_ids[str(class_name).lower()].append(obj.object_id)
 
-        If objects are present, the query maps to all object IDs.
-        If no objects are present, object_ids_output is empty.
-        """
-        query_text = self.sample_prompt()
-        object_ids = [obj.object_id for obj in objects]
-
-        query = FindQueryLoaded(
-            query_text=query_text,
-            image_id=0,
-            object_ids_output=object_ids,
-            is_exhaustive=True,
-            query_processing_order=0,
-            inference_metadata=InferenceMetadata(
-                coco_image_id=img_id,
-                original_image_id=img_id,
-                original_category_id=0,
-                original_size=(orig_h, orig_w),
-                object_id=-1,
-                frame_index=-1
+        queries = []
+        if len(class_to_object_ids) > 0:
+            for order, (query_text, obj_ids) in enumerate(class_to_object_ids.items()):
+                query = FindQueryLoaded(
+                    query_text=query_text,
+                    image_id=0,
+                    object_ids_output=obj_ids,
+                    is_exhaustive=True,
+                    query_processing_order=order,
+                    inference_metadata=InferenceMetadata(
+                        coco_image_id=img_id,
+                        original_image_id=img_id,
+                        original_category_id=0,
+                        original_size=(orig_h, orig_w),
+                        object_id=-1,
+                        frame_index=-1
+                    )
+                )
+                queries.append(query)
+        else:
+            query = FindQueryLoaded(
+                query_text=f"no {self.default_label}",
+                image_id=0,
+                object_ids_output=[],
+                is_exhaustive=True,
+                query_processing_order=0,
+                inference_metadata=InferenceMetadata(
+                    coco_image_id=img_id,
+                    original_image_id=img_id,
+                    original_category_id=0,
+                    original_size=(orig_h, orig_w),
+                    object_id=-1,
+                    frame_index=-1
+                )
             )
-        )
-        return [query]
+            queries.append(query)
+
+        return queries
 
     def __getitem__(self, idx):
         sample = self.samples[idx]
@@ -392,44 +467,44 @@ class FolderSegmentDataset(Dataset):
         pil_image = PILImage.open(img_path).convert("RGB")
         orig_w, orig_h = pil_image.size
 
-        resized_image = pil_image.resize((self.resolution, self.resolution), PILImage.BICUBIC)
-        image_tensor = self.transform(resized_image)
-
-        mask_image = PILImage.open(mask_path)
-        mask_np = np.array(mask_image)
+        image_np = np.array(pil_image)
+        mask_np = np.array(PILImage.open(mask_path))
         mask_bin = self._binarize_mask(mask_np)
 
+        transform = self._get_transform()
+        transformed = transform(image=image_np, mask=mask_bin)
+        image_np = transformed["image"]
+        mask_bin = transformed["mask"]
+
+        image_tensor = self._to_tensor_image(image_np)
+
         objects = []
+        object_class_names = []
 
         if mask_bin.sum() > 0:
             instances = self.extract_instance_masks(
-                mask_np,
+                mask_bin,
                 min_area=self.min_instance_area
             )
 
             for obj_id, (inst_mask, bbox_norm) in enumerate(instances):
                 cx, cy, w, h = bbox_norm
-
                 box_tensor = torch.tensor([cx, cy, w, h], dtype=torch.float32)
 
-                mask_t = torch.from_numpy(inst_mask).float().unsqueeze(0).unsqueeze(0)
-                mask_t = torch.nn.functional.interpolate(
-                    mask_t,
-                    size=(self.resolution, self.resolution),
-                    mode="nearest"
-                )
-                segment = mask_t.squeeze(0).squeeze(0) > 0.5
+                segment = torch.from_numpy(inst_mask.astype(np.uint8)).bool()
 
                 obj = Object(
                     bbox=box_tensor,
-                    area=(box_tensor[2] * box_tensor[3]).item(),
+                    area=float(inst_mask.sum()),
                     object_id=obj_id,
                     segment=segment
                 )
                 objects.append(obj)
+                object_class_names.append(self.default_label)
 
-        queries = self.build_random_prompt_query(
+        queries = self.build_simple_queries(
             objects=objects,
+            object_class_names=object_class_names,
             img_id=img_id,
             orig_h=orig_h,
             orig_w=orig_w,

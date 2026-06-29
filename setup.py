@@ -59,6 +59,7 @@ setup(
         "psutil>=5.9.0",
         "torchmetrics>=1.0.0",
         "typing-extensions>=4.5.0",
+        "albumentations",
     ],
     extras_require={
         "dev": [
