@@ -208,7 +208,7 @@ class FolderSegmentDataset(Dataset):
         resolution=1008,
         min_instance_area=100,
         query_text_mode="csv",
-        rotation_limit=20,
+        rotation_limit=10,
     ):
         self.data_dir = Path(data_dir)
         self.csv_path = Path(csv_path)

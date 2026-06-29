@@ -218,6 +218,7 @@ def compute_seg_dice_stats(pred: torch.Tensor, target: torch.Tensor, num_classes
 # Dataset
 # ============================================================================
 
+
 class FolderSegmentDataset(Dataset):
     """
     Folder-based segmentation dataset.
@@ -229,21 +230,6 @@ class FolderSegmentDataset(Dataset):
             **/*.{png,jpg,jpeg,bmp,tif,tiff}
           masks/
             same relative paths / filenames as images
-
-    Train transform:
-      - LongestMaxSize
-      - PadIfNeeded
-      - Random rotation
-      - Horizontal / vertical flip
-
-    Val transform:
-      - LongestMaxSize
-      - PadIfNeeded
-
-    Notes:
-      - No normalization
-      - All extracted objects get class name `default_label`
-      - Queries are built from unique class names mapped to object IDs
     """
 
     IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
@@ -254,13 +240,16 @@ class FolderSegmentDataset(Dataset):
         split="train",
         resolution=1008,
         min_instance_area=100,
-        default_label="lesion",
+        prompt_pool=None,
     ):
         self.data_dir = Path(data_dir)
         self.split = split
         self.resolution = resolution
         self.min_instance_area = min_instance_area
-        self.default_label = str(default_label).strip().lower() or "lesion"
+        self.prompt_pool = prompt_pool if prompt_pool is not None else list(DEFAULT_TEXT_PROMPTS)
+
+        if len(self.prompt_pool) == 0:
+            raise ValueError("prompt_pool must contain at least one text prompt")
 
         self.split_dir = self.data_dir / split
         self.images_dir = self.split_dir / "images"
@@ -281,16 +270,15 @@ class FolderSegmentDataset(Dataset):
                 min_height=self.resolution,
                 min_width=self.resolution,
                 border_mode=cv2.BORDER_CONSTANT,
-                fill=0,
+                fill=(0, 0, 0),
                 fill_mask=0,
-                position="center",
             ),
             A.Rotate(
                 limit=10,
                 interpolation=cv2.INTER_CUBIC,
                 mask_interpolation=cv2.INTER_NEAREST,
                 border_mode=cv2.BORDER_CONSTANT,
-                fill=0,
+                fill=(0, 0, 0),
                 fill_mask=0,
                 p=0.5,
             ),
@@ -308,11 +296,12 @@ class FolderSegmentDataset(Dataset):
                 min_height=self.resolution,
                 min_width=self.resolution,
                 border_mode=cv2.BORDER_CONSTANT,
-                fill=0,
+                fill=(0, 0, 0),
                 fill_mask=0,
-                position="center",
             ),
         ])
+
+        self.transform = self.train_transform if split == "train" else self.val_transform
 
         self.samples = []
         sample_id = 0
@@ -339,15 +328,10 @@ class FolderSegmentDataset(Dataset):
 
         print(f"Loaded folder dataset: {split} split")
         print(f"  Samples: {len(self.samples)}")
-        print(f"  Default label: {self.default_label}")
+        print(f"  Prompt count: {len(self.prompt_pool)}")
 
     def __len__(self):
         return len(self.samples)
-
-    def _get_transform(self):
-        if self.split == "train":
-            return self.train_transform
-        return self.val_transform
 
     def _binarize_mask(self, mask: np.ndarray) -> np.ndarray:
         if mask.ndim == 3:
@@ -356,32 +340,21 @@ class FolderSegmentDataset(Dataset):
             return (mask > 127).astype(np.uint8)
         return (mask > 0).astype(np.uint8)
 
-    def _to_tensor_image(self, image_np: np.ndarray) -> torch.Tensor:
-        """
-        Convert HWC uint8 RGB image to CHW float32 tensor in [0, 1].
-        No normalization.
-        """
-        return torch.from_numpy(image_np).permute(2, 0, 1).float() / 255.0
-
     def extract_instance_masks(
         self,
         mask: np.ndarray,
         min_area: int = 100
-    ) -> List[Tuple[np.ndarray, Tuple[float, float, float, float]]]:
+    ) -> List[np.ndarray]:
         """
-        Split a semantic mask into separate connected-instance masks.
+        Split a binary semantic mask into separate connected-instance masks.
 
         Returns:
-            List of:
-              (instance_mask, (x_center, y_center, width, height))
-            where bbox is normalized to [0, 1] in transformed image coordinates
+            List of binary instance masks in image coordinates.
         """
         mask = self._binarize_mask(mask)
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        height, width = mask.shape
         instances = []
-
         for contour in contours:
             x, y, w, h = cv2.boundingRect(contour)
             if w * h < min_area:
@@ -389,74 +362,60 @@ class FolderSegmentDataset(Dataset):
 
             inst_mask = np.zeros_like(mask, dtype=np.uint8)
             cv2.drawContours(inst_mask, [contour], contourIdx=-1, color=1, thickness=-1)
-
-            x_center = (x + w / 2.0) / width
-            y_center = (y + h / 2.0) / height
-            width_norm = w / width
-            height_norm = h / height
-
-            x_center = max(0.0, min(1.0, x_center))
-            y_center = max(0.0, min(1.0, y_center))
-            width_norm = max(0.0, min(1.0, width_norm))
-            height_norm = max(0.0, min(1.0, height_norm))
-
-            instances.append((
-                inst_mask,
-                (x_center, y_center, width_norm, height_norm)
-            ))
+            instances.append(inst_mask)
 
         return instances
 
-    def build_simple_queries(
+    def sample_prompt(self) -> str:
+        return random.choice(self.prompt_pool)
+
+    def build_random_prompt_query(
         self,
         objects,
-        object_class_names,
         img_id,
         orig_h,
         orig_w,
     ):
-        class_to_object_ids = defaultdict(list)
-        for obj, class_name in zip(objects, object_class_names):
-            class_to_object_ids[str(class_name).lower()].append(obj.object_id)
+        query_text = self.sample_prompt()
+        object_ids = [obj.object_id for obj in objects]
 
-        queries = []
-        if len(class_to_object_ids) > 0:
-            for order, (query_text, obj_ids) in enumerate(class_to_object_ids.items()):
-                query = FindQueryLoaded(
-                    query_text=query_text,
-                    image_id=0,
-                    object_ids_output=obj_ids,
-                    is_exhaustive=True,
-                    query_processing_order=order,
-                    inference_metadata=InferenceMetadata(
-                        coco_image_id=img_id,
-                        original_image_id=img_id,
-                        original_category_id=0,
-                        original_size=(orig_h, orig_w),
-                        object_id=-1,
-                        frame_index=-1
-                    )
-                )
-                queries.append(query)
-        else:
-            query = FindQueryLoaded(
-                query_text=f"no {self.default_label}",
-                image_id=0,
-                object_ids_output=[],
-                is_exhaustive=True,
-                query_processing_order=0,
-                inference_metadata=InferenceMetadata(
-                    coco_image_id=img_id,
-                    original_image_id=img_id,
-                    original_category_id=0,
-                    original_size=(orig_h, orig_w),
-                    object_id=-1,
-                    frame_index=-1
-                )
+        query = FindQueryLoaded(
+            query_text=query_text,
+            image_id=0,
+            object_ids_output=object_ids,
+            is_exhaustive=True,
+            query_processing_order=0,
+            inference_metadata=InferenceMetadata(
+                coco_image_id=img_id,
+                original_image_id=img_id,
+                original_category_id=0,
+                original_size=(orig_h, orig_w),
+                object_id=-1,
+                frame_index=-1,
             )
-            queries.append(query)
+        )
+        return [query]
 
-        return queries
+    def _mask_to_bbox_xywh_norm(self, mask: np.ndarray) -> Tuple[float, float, float, float]:
+        ys, xs = np.where(mask > 0)
+        if len(xs) == 0 or len(ys) == 0:
+            return 0.0, 0.0, 0.0, 0.0
+
+        h, w = mask.shape
+        x_min, x_max = xs.min(), xs.max()
+        y_min, y_max = ys.min(), ys.max()
+
+        bw = x_max - x_min + 1
+        bh = y_max - y_min + 1
+        cx = x_min + bw / 2.0
+        cy = y_min + bh / 2.0
+
+        return (
+            float(cx / w),
+            float(cy / h),
+            float(bw / w),
+            float(bh / h),
+        )
 
     def __getitem__(self, idx):
         sample = self.samples[idx]
@@ -471,40 +430,31 @@ class FolderSegmentDataset(Dataset):
         mask_np = np.array(PILImage.open(mask_path))
         mask_bin = self._binarize_mask(mask_np)
 
-        transform = self._get_transform()
-        transformed = transform(image=image_np, mask=mask_bin)
-        image_np = transformed["image"]
-        mask_bin = transformed["mask"]
+        transformed = self.transform(image=image_np, mask=mask_bin)
+        image_aug = transformed["image"]
+        mask_aug = transformed["mask"]
 
-        image_tensor = self._to_tensor_image(image_np)
+        image_tensor = torch.from_numpy(image_aug).permute(2, 0, 1).float() / 255.0
 
         objects = []
-        object_class_names = []
+        if mask_aug.sum() > 0:
+            instances = self.extract_instance_masks(mask_aug, min_area=self.min_instance_area)
 
-        if mask_bin.sum() > 0:
-            instances = self.extract_instance_masks(
-                mask_bin,
-                min_area=self.min_instance_area
-            )
-
-            for obj_id, (inst_mask, bbox_norm) in enumerate(instances):
-                cx, cy, w, h = bbox_norm
+            for obj_id, inst_mask in enumerate(instances):
+                cx, cy, w, h = self._mask_to_bbox_xywh_norm(inst_mask)
                 box_tensor = torch.tensor([cx, cy, w, h], dtype=torch.float32)
-
-                segment = torch.from_numpy(inst_mask.astype(np.uint8)).bool()
+                segment = torch.from_numpy(inst_mask.astype(np.bool_))
 
                 obj = Object(
                     bbox=box_tensor,
                     area=float(inst_mask.sum()),
                     object_id=obj_id,
-                    segment=segment
+                    segment=segment,
                 )
                 objects.append(obj)
-                object_class_names.append(self.default_label)
 
-        queries = self.build_simple_queries(
+        queries = self.build_random_prompt_query(
             objects=objects,
-            object_class_names=object_class_names,
             img_id=img_id,
             orig_h=orig_h,
             orig_w=orig_w,
@@ -513,13 +463,13 @@ class FolderSegmentDataset(Dataset):
         image_obj = Image(
             data=image_tensor,
             objects=objects,
-            size=(self.resolution, self.resolution),
+            size=(image_tensor.shape[1], image_tensor.shape[2]),
         )
 
         return Datapoint(
             find_queries=queries,
             images=[image_obj],
-            raw_images=[pil_image]
+            raw_images=[pil_image],
         )
 
 
